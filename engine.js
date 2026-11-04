@@ -922,6 +922,37 @@ export function itemsFromCsv(text) {
  * event.
  * ------------------------------------------------------------------ */
 
+/**
+ * The rule behind each trait. A sheet names one in its `ability` column; the
+ * words on the card stay in `traitText`, for the table to read.
+ *
+ *   logical-detachment    once per round, ignore the first Sanity loss from an Event
+ *   steel-nerves          once per turn, reroll a failed Flee
+ *   whispers-from-beyond  once per round, as an action, look at the top Encounter card
+ *   field-medic           an adjacent investigator who regains Health regains 1 more
+ *   hunches               once per turn, a free step after Investigating
+ *   bartered-insight      as an action, spend 2 Clues to regain 1 Sanity
+ */
+const ABILITIES = {
+  'logical-detachment': { active: false },
+  'steel-nerves': { active: false },
+  'whispers-from-beyond': { active: true, label: 'Look at the top Encounter card' },
+  'field-medic': { active: false },
+  hunches: { active: false },
+  'bartered-insight': { active: true, label: 'Spend 2 Clues to regain 1 Sanity' },
+};
+
+function readAbility(value, id) {
+  const text = (value ?? '').trim();
+  if (text === '') return null;
+  if (!ABILITIES[text]) {
+    throw new Error(
+      `investigator "${id}" has the ability "${text}", which is not one of ${Object.keys(ABILITIES).join(', ')}`,
+    );
+  }
+  return text;
+}
+
 export function investigatorsFromCsv(text) {
   const [header, ...rows] = parseCsv(text);
   if (!header) throw new Error('investigator CSV is empty');
@@ -944,6 +975,7 @@ export function investigatorsFromCsv(text) {
   const iTrait = column('trait', false);
   const iTraitText = column('traitText', false);
   const iTraitNeeds = column('traitNeeds', false);
+  const iAbility = column('ability', false);
   const iBio = column('bio', false);
 
   const wholeNumber = (row, index, id, what) => {
@@ -973,6 +1005,7 @@ export function investigatorsFromCsv(text) {
       clueLimit: wholeNumber(row, iClueLimit, id, 'Clue Limit'),
       trait: (row[iTrait] ?? '').trim(),
       traitText: (row[iTraitText] ?? '').trim(),
+      ability: readAbility(iAbility === -1 ? '' : row[iAbility], id),
       traitNeeds: (row[iTraitNeeds] ?? '').trim(),
       bio: (row[iBio] ?? '').trim(),
     };
@@ -1669,6 +1702,7 @@ export function createGame(ctx, options = {}) {
         sanity: sheet.sanity,
         sanityMax: sheet.sanity,
         clueLimit: sheet.clueLimit,
+        ability: sheet.ability ?? null,
       };
     }),
     rooms: { [roomKey(startSlotR, startSlotC)]: { roomId: scenario.startRoom, rot: 0 } },
@@ -1924,7 +1958,7 @@ export function reduce(state, action, ctx) {
 
   // "While engaged, you may only Attack or Flee." Items cost no action and the
   // turn can still be ended.
-  if (['MOVE', 'INVESTIGATE', 'SEAL', 'ROOM_SPECIAL'].includes(action.type)) {
+  if (['MOVE', 'INVESTIGATE', 'SEAL', 'ROOM_SPECIAL', 'USE_TRAIT'].includes(action.type)) {
     const held = engagedWith(next, currentPlayer(next));
     if (held.length > 0) {
       throw new Error(
@@ -1958,6 +1992,9 @@ export function reduce(state, action, ctx) {
       break;
     case 'ROOM_SPECIAL':
       out = doRoomSpecial(next, ctx);
+      break;
+    case 'USE_TRAIT':
+      out = doTrait(next, ctx);
       break;
     case 'ATTACK':
       out = doCombat(next, ctx, 'attack', action.monsterId);
@@ -2068,6 +2105,7 @@ function seatInvestigator(state, ctx, player, sheet) {
     sanity: sheet.sanity,
     sanityMax: sheet.sanity,
     clueLimit: sheet.clueLimit,
+    ability: sheet.ability ?? null,
     items: [],
     clues: 0,
     pos: startPosition(state, ctx) ?? player.pos,
@@ -2406,11 +2444,17 @@ function resolveCombat(state, ctx, player, monster, kind) {
     return;
   }
 
-  if (value >= 4) {
+  let flight = value;
+  if (flight < 4 && player.ability === 'steel-nerves' && !player.fledReroll) {
+    player.fledReroll = true;
+    pushLog(state, `${player.name} rolls ${flight} and steadies (Steel Nerves) — rolling again.`);
+    flight = rollD6(state, 'a flight');
+  }
+  if (flight >= 4) {
     disengage(player, monster);
-    pushLog(state, `${player.name} flees ${theName(monster.name)}: ${value} — free.`);
+    pushLog(state, `${player.name} flees ${theName(monster.name)}: ${flight} — free.`);
   } else {
-    pushLog(state, `${player.name} tries to flee ${theName(monster.name)}: ${value} — caught.`);
+    pushLog(state, `${player.name} tries to flee ${theName(monster.name)}: ${flight} — caught.`);
     monsterHits(state, monster, player, COMBAT_DAMAGE);
   }
 }
@@ -2643,6 +2687,67 @@ function doRoomSpecial(state, ctx) {
   return state;
 }
 
+/* ------------------------------------------------------------------ *
+ * Traits used as an action
+ * ------------------------------------------------------------------ */
+
+/** The current investigator's trait, if it is one they use on their turn. */
+export function activeTrait(state, ctx) {
+  const player = currentPlayer(state);
+  const rule = ABILITIES[player?.ability];
+  if (!rule?.active) return null;
+  const sheet = ctx.investigators?.[player.investigatorId];
+  return { ability: player.ability, name: sheet?.trait ?? player.ability, label: rule.label };
+}
+
+/** Why the current investigator cannot use their trait now, or null. */
+export function traitProblem(state, ctx) {
+  const trait = activeTrait(state, ctx);
+  if (!trait) return 'this investigator has no trait to use as an action';
+  if (state.over) return 'the game is over';
+  if (state.pending) return 'place the drawn room before doing anything else';
+  if (state.choice) return 'answer the choice on the table first';
+  if (state.actionsLeft <= 0) return 'no actions left this turn';
+  const player = currentPlayer(state);
+  if (engagedWith(state, player).length > 0) return 'you are engaged with a monster — Attack or Flee first';
+
+  if (trait.ability === 'whispers-from-beyond') {
+    if (player.whisperedRound === state.round) return 'the voices have already spoken this round';
+    if (state.encounterDeck.length === 0) return 'the encounter deck is empty';
+  }
+  if (trait.ability === 'bartered-insight') {
+    if ((player.clues ?? 0) < 2) return `${player.name} needs 2 Clues to barter`;
+    if (player.sanity >= player.sanityMax) return `${player.name} is already at full Sanity`;
+  }
+  return null;
+}
+
+function doTrait(state, ctx) {
+  const problem = traitProblem(state, ctx);
+  if (problem) throw new Error(problem);
+  const trait = activeTrait(state, ctx);
+  const player = currentPlayer(state);
+  state.actionsLeft -= 1;
+
+  if (trait.ability === 'whispers-from-beyond') {
+    player.whisperedRound = state.round;
+    // Draws take from the end, so the top of the deck is the last card.
+    const id = state.encounterDeck[state.encounterDeck.length - 1];
+    const card = ctx.encounterCards?.[id];
+    const word = card ? ENCOUNTER_WORD[card.type] : 'card';
+    state.peek = { by: player.id, round: state.round, cardId: id, type: card?.type ?? null };
+    pushLog(state, `${player.name} listens (${trait.name}): the top Encounter card is ${/^[AEIOU]/.test(word) ? 'an' : 'a'} ${word}.`);
+    return state;
+  }
+
+  if (trait.ability === 'bartered-insight') {
+    player.clues -= 2;
+    pushLog(state, `${player.name} trades 2 Clues for clarity (${trait.name}).`);
+    changePool(state, player, 'sanity', 1, trait.name);
+  }
+  return state;
+}
+
 /** The investigators still in the game. */
 export function onTable(state) {
   return state.players.filter((p) => !p.out);
@@ -2736,6 +2841,12 @@ function doInvestigate(state, ctx) {
   // over: the card turns over, and what it calls for is collected at once.
   turnUp(state, ctx, key, 'the investigator looked into it');
   collectEncounter(state, ctx, key);
+  // Hunches: once a turn, a free step after Investigating.
+  if (player.ability === 'hunches' && !player.hunchUsed && !player.out) {
+    player.hunchUsed = true;
+    state.stepsLeft += 1;
+    pushLog(state, `${player.name} follows a hunch (Hunches): 1 free space of movement.`);
+  }
   return state;
 }
 
@@ -2813,6 +2924,18 @@ function changePool(state, player, pool, amount, source) {
   }
 
   if (amount < 0) {
+    // Logical Detachment: once a round, the first Sanity an Event would take.
+    if (
+      pool === 'sanity' &&
+      source === 'this event' &&
+      player.ability === 'logical-detachment' &&
+      player.detachedRound !== state.round
+    ) {
+      player.detachedRound = state.round;
+      pushLog(state, `${player.name} keeps a cool head (Logical Detachment): no Sanity is lost to this event.`);
+      return;
+    }
+
     const wardKey = pool === 'sanity' ? 'sanityShield' : 'damageShield';
     if ((player[wardKey] ?? 0) > 0) {
       player[wardKey] -= 1;
@@ -2844,6 +2967,16 @@ function changePool(state, player, pool, amount, source) {
 
   const before = player[pool];
   player[pool] = Math.min(max, before + amount);
+  // Field Medic: someone beside Dr. Graves who regains Health regains one more.
+  if (pool === 'health' && player[pool] > before && player[pool] < max) {
+    const medic = onTable(state).find(
+      (p) => p.id !== player.id && p.ability === 'field-medic' && within(p.pos, player.pos, 1),
+    );
+    if (medic) {
+      player[pool] += 1;
+      pushLog(state, `${medic.name} tends the wound (Field Medic): +1 Health more.`);
+    }
+  }
   const gained = player[pool] - before;
   pushLog(
     state,
@@ -3272,6 +3405,7 @@ function doEndTurn(state, ctx) {
   }
   player.bound = [];
   player.fledReroll = false;
+  player.hunchUsed = false;
 
   let nextSeat = state.turnIndex + 1;
   while (nextSeat < state.players.length && state.players[nextSeat].out) nextSeat += 1;

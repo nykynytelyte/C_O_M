@@ -33,6 +33,8 @@ import {
   engagedWith,
   roomSpecialHere,
   roomSpecialProblem,
+  activeTrait,
+  traitProblem,
   useItemProblem,
   doorsAt,
   roomKey,
@@ -81,6 +83,7 @@ async function boot() {
     'attack',
     'flee',
     'roomuse',
+    'trait',
     'flash',
   ]) {
     el[id] = document.getElementById(id);
@@ -138,6 +141,7 @@ async function boot() {
   el.attack.addEventListener('click', () => dispatch({ type: 'ATTACK' }));
   el.flee.addEventListener('click', () => dispatch({ type: 'FLEE' }));
   el.roomuse.addEventListener('click', () => dispatch({ type: 'ROOM_SPECIAL' }));
+  el.trait.addEventListener('click', () => dispatch({ type: 'USE_TRAIT' }));
   el.seal.hidden = !ctx.scenario.seal;
   el.newgame.addEventListener('click', () => newGame(true));
   el.copy.addEventListener('click', copyReplay);
@@ -314,6 +318,7 @@ function renderStatus() {
     el.attack.disabled = true;
     el.flee.disabled = true;
     el.roomuse.hidden = true;
+    el.trait.hidden = true;
     return;
   }
 
@@ -333,6 +338,14 @@ function renderStatus() {
     el.roomuse.textContent = `${special.room.name}: ${special.label}`;
     el.roomuse.disabled = Boolean(problem);
     el.roomuse.title = problem ?? `${special.label}. Costs one action.`;
+  }
+  const trait = activeTrait(state, ctx);
+  el.trait.hidden = !trait;
+  if (trait) {
+    const problem = traitProblem(state, ctx);
+    el.trait.textContent = `${trait.name}: ${trait.label}`;
+    el.trait.disabled = Boolean(problem);
+    el.trait.title = problem ?? `${trait.label}. Costs one action.`;
   }
   const holding = engagedWith(state, currentPlayer(state));
 
@@ -698,7 +711,7 @@ function renderParty() {
       trait.className = 'trait';
       trait.textContent = sheet.traitNeeds
         ? `${sheet.trait} — pending: ${sheet.traitNeeds}`
-        : sheet.trait;
+        : `${sheet.trait}: ${sheet.traitText}`;
       trait.title = sheet.traitText;
       block.appendChild(trait);
     }

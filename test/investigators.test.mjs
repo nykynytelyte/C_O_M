@@ -16,6 +16,7 @@ import {
   pendingOrientations,
   useItemProblem,
   roomSpecialProblem,
+  traitProblem,
   investigatorsFromCsv,
   roomsFromCsv,
   entrancesFromCsv,
@@ -60,22 +61,19 @@ const ctx = { scenario, rooms, entrances, encounterCards, items, events, investi
   assert.equal(clara.sanity, 6, 'and so does Sanity');
   assert.equal(clara.clueLimit, 5, 'and the Clue Limit');
   assert.equal(clara.trait, 'Logical Detachment');
-  assert.match(clara.traitNeeds, /Events that cost Sanity/, 'her trait says what it waits for');
+  assert.equal(clara.ability, 'logical-detachment', 'her trait has a rule behind it');
   assert.match(clara.bio, /Harrowgate/, 'the back of the card is kept as well');
 
   const gideon = investigators['2'];
   assert.equal(gideon.health, 6, 'Gideon is the tougher one');
   assert.equal(gideon.sanity, 4, 'and the more brittle one');
 
-  // No trait is allowed to pretend to work: every one of the six names the rule
-  // it is still waiting for, in words a player can read.
+  // Every trait has a rule behind it, so none of them waits on anything.
   for (const sheet of Object.values(investigators)) {
     assert.ok(sheet.trait, `${sheet.name} has a trait`);
     assert.ok(sheet.traitText, `${sheet.name}'s trait is written out`);
-    assert.ok(
-      sheet.traitNeeds.length > 0,
-      `${sheet.name}'s trait pretends to work without saying what is missing`,
-    );
+    assert.ok(sheet.ability, `${sheet.name}'s trait has a rule`);
+    assert.equal(sheet.traitNeeds, '', `${sheet.name}'s trait waits on nothing`);
     assert.ok(Number.isInteger(sheet.health) && sheet.health > 0, `${sheet.name} has Health`);
     assert.ok(Number.isInteger(sheet.sanity) && sheet.sanity > 0, `${sheet.name} has Sanity`);
   }
@@ -219,6 +217,8 @@ const ctx = { scenario, rooms, entrances, encounterCards, items, events, investi
     entranceId = '17',
   ) => {
     const game = createGame(ctx, { seed: 41, playerCount: 2, investigatorIds: ['1', '2'] });
+    // These read the cards themselves; Clara's own trait has its own test.
+    for (const p of game.players) p.ability = null;
     game.entranceDeck = [entranceId];
     game.encounterDeck = encounterIds.slice();
     game.eventDeck = eventIds.slice();
@@ -501,6 +501,101 @@ const ctx = { scenario, rooms, entrances, encounterCards, items, events, investi
   const whole = structuredClone(game);
   whole.players[0].sanity = whole.players[0].sanityMax;
   assert.match(roomSpecialProblem(whole, ctx), /full Sanity/, 'no Clue is wasted at full Sanity');
+}
+
+/* ------------------------------------------------------------------ *
+ * Traits
+ * ------------------------------------------------------------------ */
+{
+  const seat = (ids, seed = 7) => createGame(ctx, { seed, playerCount: ids.length, investigatorIds: ids });
+  // An Event card lying face up under the current investigator, ready to read.
+  const eventUnderfoot = (game, eventId) => {
+    const me = game.players[game.turnIndex];
+    me.pos = { gr: 1, gc: 0 };
+    game.encounters['1,0'] = {
+      entranceId: '17', room: '0,0', number: 4, cardId: '19', type: 'event', faceUp: true,
+    };
+    game.eventDeck = [eventId];
+    game.eventDiscard = [];
+    game.actionsLeft = 2;
+  };
+  const monsterAt = (game, pos) => {
+    game.monsters.push({ id: `t${game.nextMonster++}`, kind: 'card', name: 'Husk', health: 2, healthMax: 2, pos });
+    return game.monsters.at(-1).id;
+  };
+
+  // Clara — Logical Detachment: the first Sanity an Event takes each round is ignored.
+  let clara = seat(['1', '2']);
+  eventUnderfoot(clara, '10');
+  clara = reduce(clara, { type: 'INVESTIGATE' }, ctx);
+  assert.equal(clara.players[0].sanity, 6, 'the first event loss of the round is ignored');
+  assert.match(clara.log.join('\n'), /Logical Detachment/);
+  eventUnderfoot(clara, '10');
+  clara = reduce(clara, { type: 'INVESTIGATE' }, ctx);
+  assert.equal(clara.players[0].sanity, 5, 'the second one in the same round is not');
+
+  // Gideon — Steel Nerves: a failed Flee is rolled again, once a turn.
+  let rerolled = 0;
+  for (let seed = 1; seed <= 40; seed++) {
+    const game = seat(['2', '1'], seed);
+    game.players[0].engaged = [monsterAt(game, { gr: 1, gc: 2 })];
+    const after = reduce(game, { type: 'FLEE' }, ctx);
+    const log = after.log.join('\n');
+    if (/Steel Nerves/.test(log)) {
+      rerolled += 1;
+      assert.equal((log.match(/Steel Nerves/g) ?? []).length, 1, 'only one reroll');
+    } else {
+      assert.match(log, /— free\./, 'no reroll means the first roll escaped');
+    }
+  }
+  assert.ok(rerolled > 0, 'a failed Flee was rerolled');
+
+  // Lucille — Whispers from Beyond: an action to see the top Encounter card, once a round.
+  const lucille = seat(['3', '1']);
+  assert.equal(traitProblem(lucille, ctx), null);
+  const heard = reduce(lucille, { type: 'USE_TRAIT' }, ctx);
+  const top = lucille.encounterDeck.at(-1);
+  assert.equal(heard.peek.cardId, top, 'she sees the card that will be drawn next');
+  assert.equal(heard.encounterDeck.length, lucille.encounterDeck.length, 'and leaves it there');
+  assert.equal(heard.actionsLeft, lucille.actionsLeft - 1, 'in place of an action');
+  assert.match(traitProblem(heard, ctx), /already spoken this round/);
+
+  // Dr. Graves — Field Medic: someone beside him who regains Health regains 1 more.
+  const ward = seat(['1', '4']);
+  ward.players[0].health = 1;
+  ward.players[0].items = ['2']; // First Aid Kit: +1 Health
+  ward.players[1].pos = { gr: 1, gc: 2 };
+  const patched = reduce(ward, { type: 'USE_ITEM', itemId: '2' }, ctx);
+  assert.equal(patched.players[0].health, 3, 'the kit and the doctor: +2');
+  assert.match(patched.log.join('\n'), /Field Medic/);
+  const alone = structuredClone(ward);
+  alone.players[1].pos = { gr: 4, gc: 4 };
+  assert.equal(reduce(alone, { type: 'USE_ITEM', itemId: '2' }, ctx).players[0].health, 2, 'not from afar');
+
+  // Marion — Hunches: a free step after Investigating, once a turn.
+  let marion = seat(['5', '1']);
+  eventUnderfoot(marion, '12');
+  marion = reduce(marion, { type: 'INVESTIGATE' }, ctx);
+  assert.equal(marion.stepsLeft, 1, 'a free space of movement');
+  assert.match(marion.log.join('\n'), /Hunches/);
+  marion.stepsLeft = 0;
+  eventUnderfoot(marion, '12');
+  marion = reduce(marion, { type: 'INVESTIGATE' }, ctx);
+  assert.equal(marion.stepsLeft, 0, 'only once a turn');
+
+  // Silas — Bartered Insight: 2 Clues for 1 Sanity, as an action.
+  const silas = seat(['6', '1']);
+  silas.players[0].clues = 1;
+  silas.players[0].sanity = silas.players[0].sanityMax - 2;
+  assert.match(traitProblem(silas, ctx), /needs 2 Clues/);
+  silas.players[0].clues = 3;
+  const traded = reduce(silas, { type: 'USE_TRAIT' }, ctx);
+  assert.equal(traded.players[0].clues, 1);
+  assert.equal(traded.players[0].sanity, silas.players[0].sanity + 1);
+  assert.equal(traded.actionsLeft, silas.actionsLeft - 1);
+
+  // Clara has nothing to use as an action.
+  assert.match(traitProblem(seat(['1', '2']), ctx), /no trait to use/);
 }
 
 console.log('INVESTIGATOR SHEETS OK');
