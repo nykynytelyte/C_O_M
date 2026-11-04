@@ -1970,7 +1970,7 @@ export function reduce(state, action, ctx) {
 
   // "While engaged, you may only Attack or Flee." Items cost no action and the
   // turn can still be ended.
-  if (['MOVE', 'INVESTIGATE', 'SEAL', 'ROOM_SPECIAL', 'USE_TRAIT'].includes(action.type)) {
+  if (['MOVE', 'INVESTIGATE', 'SEAL', 'ROOM_SPECIAL', 'USE_TRAIT', 'FORCE_WALL'].includes(action.type)) {
     const held = engagedWith(next, currentPlayer(next));
     if (held.length > 0) {
       throw new Error(
@@ -2007,6 +2007,9 @@ export function reduce(state, action, ctx) {
       break;
     case 'USE_TRAIT':
       out = doTrait(next, ctx);
+      break;
+    case 'FORCE_WALL':
+      out = doForceWall(next, ctx, action.to);
       break;
     case 'ATTACK':
       out = doCombat(next, ctx, 'attack', action.monsterId);
@@ -2760,6 +2763,119 @@ function doTrait(state, ctx) {
   return state;
 }
 
+/* ------------------------------------------------------------------ *
+ * Forcing a wall
+ *
+ * The house can close up around the investigators until there is no door
+ * left that leads anywhere. The core rule `escape` lets them push through a
+ * wall into the room next door, without changing a single room card:
+ *
+ *   "escape": { "fromRound": 10, "onlyWhenTrapped": false, "sanity": 1 }
+ *
+ *   fromRound        the first round it may be used (1 = from the start)
+ *   onlyWhenTrapped  only when no door leads out of the investigator's room
+ *   sanity           what it costs, on top of one action
+ *
+ * Leave it out and the walls hold.
+ * ------------------------------------------------------------------ */
+
+/** Is there any door out of this investigator's room, monsters aside? */
+export function trappedInRoom(state, ctx, player) {
+  const slot = slotOf(player.pos);
+  const open = { ...state, monsters: [], drewThisTurn: false };
+  for (const from of squaresInRoom(slot)) {
+    for (const dir of DIRS) {
+      const to = { gr: from.gr + dir.dr, gc: from.gc + dir.dc };
+      const there = slotOf(to);
+      if (there.R === slot.R && there.C === slot.C) continue;
+      if (!stepProblem(open, from, to, ctx)) return false;
+    }
+  }
+  return true;
+}
+
+/** The squares through a wall from here into a room already on the table. */
+function wallSquares(state, player) {
+  const slot = slotOf(player.pos);
+  const out = [];
+  for (const dir of DIRS) {
+    const to = { gr: player.pos.gr + dir.dr, gc: player.pos.gc + dir.dc };
+    const there = slotOf(to);
+    if (there.R === slot.R && there.C === slot.C) continue;
+    if (!roomEntryAt(state, there)) continue;
+    if ((state.monsters ?? []).some((m) => m.pos.gr === to.gr && m.pos.gc === to.gc)) continue;
+    out.push(to);
+  }
+  return out;
+}
+
+/** Why the current investigator cannot force a wall, or null. */
+export function forceWallProblem(state, ctx) {
+  const rule = ctx.scenario.escape;
+  if (!rule) return 'the walls hold in this game';
+  if (state.over) return 'the game is over';
+  if (state.pending) return 'place the drawn room before doing anything else';
+  if (state.choice) return 'answer the choice on the table first';
+  if (state.actionsLeft <= 0) return 'no actions left this turn';
+  if (state.round < (rule.fromRound ?? 1)) return `the walls hold until round ${rule.fromRound}`;
+  const player = currentPlayer(state);
+  if (engagedWith(state, player).length > 0) return 'you are engaged with a monster — Attack or Flee first';
+  if (rule.onlyWhenTrapped && !trappedInRoom(state, ctx, player)) {
+    return 'there is still a door out of this room';
+  }
+  if (rule.sanity && (player.sanity ?? 0) <= rule.sanity) {
+    return `${player.name} has too little Sanity left to force a wall`;
+  }
+  if (wallSquares(state, player).length === 0) {
+    return 'stand against a wall with a room on the other side';
+  }
+  return null;
+}
+
+export function forceWallTargets(state) {
+  return wallSquares(state, currentPlayer(state));
+}
+
+function doForceWall(state, ctx, to) {
+  const problem = forceWallProblem(state, ctx);
+  if (problem) throw new Error(problem);
+  const player = currentPlayer(state);
+  const squares = wallSquares(state, player);
+
+  if (to) {
+    const target = squares.find((p) => p.gr === to.gr && p.gc === to.gc);
+    if (!target) throw new Error('there is no room on the other side of that wall');
+    forceThrough(state, ctx, player, target);
+    return state;
+  }
+  if (squares.length === 1) {
+    forceThrough(state, ctx, player, squares[0]);
+    return state;
+  }
+  beginChoice(state, {
+    kind: 'force-wall',
+    playerId: player.id,
+    prompt: 'Which wall do you force?',
+    options: squares.map((p) => ({
+      id: posKey(p),
+      label: ctx.rooms[roomEntryAt(state, slotOf(p)).roomId].name,
+    })),
+  });
+  return state;
+}
+
+function forceThrough(state, ctx, player, to) {
+  const rule = ctx.scenario.escape;
+  state.actionsLeft -= 1;
+  const there = slotOf(to);
+  const room = ctx.rooms[roomEntryAt(state, there).roomId];
+  player.pos = { ...to };
+  pushLog(state, `${player.name} forces a way through the wall into the ${room.name}.`);
+  if (rule.sanity) changePool(state, player, 'sanity', -rule.sanity, 'forcing the wall');
+  resolveEntrance(state, ctx, there, to);
+  flipForSecondPlayer(state, ctx, there);
+}
+
 /** The investigators still in the game. */
 export function onTable(state) {
   return state.players.filter((p) => !p.out);
@@ -3044,6 +3160,11 @@ function resolveChoice(state, ctx, choice, picked) {
     const target = (state.monsters ?? []).find((m) => m.id === picked.id);
     if (!target) throw new Error('that monster is no longer on the table');
     bindMonster(state, chooser, target, choice.source);
+    return;
+  }
+
+  if (choice.kind === 'force-wall') {
+    forceThrough(state, ctx, chooser, posOfKey(String(picked.id)));
     return;
   }
 

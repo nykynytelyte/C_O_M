@@ -35,6 +35,7 @@ import {
   roomSpecialProblem,
   activeTrait,
   traitProblem,
+  forceWallProblem,
   useItemProblem,
   doorsAt,
   roomKey,
@@ -84,6 +85,7 @@ async function boot() {
     'flee',
     'roomuse',
     'trait',
+    'forcewall',
     'flash',
   ]) {
     el[id] = document.getElementById(id);
@@ -142,6 +144,7 @@ async function boot() {
   el.flee.addEventListener('click', () => dispatch({ type: 'FLEE' }));
   el.roomuse.addEventListener('click', () => dispatch({ type: 'ROOM_SPECIAL' }));
   el.trait.addEventListener('click', () => dispatch({ type: 'USE_TRAIT' }));
+  el.forcewall.addEventListener('click', () => dispatch({ type: 'FORCE_WALL' }));
   el.seal.hidden = !ctx.scenario.seal;
   el.newgame.addEventListener('click', () => newGame(true));
   el.copy.addEventListener('click', copyReplay);
@@ -319,6 +322,7 @@ function renderStatus() {
     el.flee.disabled = true;
     el.roomuse.hidden = true;
     el.trait.hidden = true;
+    el.forcewall.hidden = true;
     return;
   }
 
@@ -346,6 +350,14 @@ function renderStatus() {
     el.trait.textContent = `${trait.name}: ${trait.label}`;
     el.trait.disabled = Boolean(problem);
     el.trait.title = problem ?? `${trait.label}. Costs one action.`;
+  }
+  const rule = ctx.scenario.escape;
+  el.forcewall.hidden = !rule || state.round < (rule.fromRound ?? 1);
+  if (!el.forcewall.hidden) {
+    const problem = forceWallProblem(state, ctx);
+    el.forcewall.disabled = Boolean(problem);
+    el.forcewall.title =
+      problem ?? 'Push through a wall into the room on the other side. Costs one action.';
   }
   const holding = engagedWith(state, currentPlayer(state));
 

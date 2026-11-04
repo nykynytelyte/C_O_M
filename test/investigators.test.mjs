@@ -17,6 +17,7 @@ import {
   useItemProblem,
   roomSpecialProblem,
   traitProblem,
+  forceWallProblem,
   investigatorsFromCsv,
   roomsFromCsv,
   entrancesFromCsv,
@@ -596,6 +597,45 @@ const ctx = { scenario, rooms, entrances, encounterCards, items, events, investi
 
   // Clara has nothing to use as an action.
   assert.match(traitProblem(seat(['1', '2']), ctx), /no trait to use/);
+}
+
+/* ------------------------------------------------------------------ *
+ * Forcing a wall: from round 10, as an action
+ * ------------------------------------------------------------------ */
+{
+  assert.deepEqual(ctx.scenario.escape, { fromRound: 10, onlyWhenTrapped: false, sanity: 0 });
+
+  const game = createGame(ctx, { seed: 9, playerCount: 2, investigatorIds: ['1', '2'] });
+  game.entranceDeck = ['17'];
+  game.rooms['0,1'] = { roomId: 'study', rot: 0 }; // east of the Foyer
+  game.players[0].pos = { gr: 0, gc: 2 }; // the Foyer's north-east corner
+  assert.match(forceWallProblem(game, ctx), /until round 10/, 'the walls hold early on');
+
+  game.round = 10;
+  assert.equal(forceWallProblem(game, ctx), null);
+  const through = reduce(game, { type: 'FORCE_WALL' }, ctx);
+  assert.deepEqual(through.players[0].pos, { gr: 0, gc: 3 }, 'straight through into the Study');
+  assert.equal(through.actionsLeft, game.actionsLeft - 1, 'it costs an action');
+  assert.equal(through.players[0].sanity, game.players[0].sanity, 'and nothing else');
+  assert.equal(through.lastEntrance?.slot, '0,1', 'entering the room turns its card');
+
+  // Standing in the middle of a room there is no wall to push through.
+  const middle = structuredClone(game);
+  middle.players[0].pos = { gr: 1, gc: 1 };
+  assert.match(forceWallProblem(middle, ctx), /stand against a wall/);
+
+  // In a corner with rooms on two sides, the player chooses.
+  const corner = structuredClone(game);
+  corner.rooms['-1,0'] = { roomId: 'gallery', rot: 0 };
+  const asked = reduce(corner, { type: 'FORCE_WALL' }, ctx);
+  assert.equal(asked.choice?.kind, 'force-wall');
+  const north = asked.choice.options.find((o) => o.label === 'Gallery');
+  const done = reduce(asked, { type: 'CHOOSE', optionId: north.id }, ctx);
+  assert.deepEqual(done.players[0].pos, { gr: -1, gc: 2 });
+
+  // A scenario may switch it off.
+  const walled = buildScenario(core, { id: 't', name: 'T', rules: { escape: null } });
+  assert.equal(walled.escape, null);
 }
 
 console.log('INVESTIGATOR SHEETS OK');

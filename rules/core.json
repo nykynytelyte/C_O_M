@@ -1,8 +1,18 @@
 {
   "startRoom": "foyer",
-  "startSlot": [0, 0],
-  "startSpace": [1, 1],
-  "players": { "min": 1, "max": 4, "default": 2 },
+  "startSlot": [
+    0,
+    0
+  ],
+  "startSpace": [
+    1,
+    1
+  ],
+  "players": {
+    "min": 1,
+    "max": 4,
+    "default": 2
+  },
   "turn": {
     "actionsPerTurn": 2,
     "moveRange": 2
@@ -10,12 +20,25 @@
   "shift": {
     "method": "A",
     "die": 6,
-    "ladder": [4, 3, 2, 1, 0],
+    "ladder": [
+      4,
+      3,
+      2,
+      1,
+      0
+    ],
     "degrees": 90,
     "affects": "orthogonal-neighbours-of-roller",
-    "exemptRooms": ["foyer"]
+    "exemptRooms": [
+      "foyer"
+    ]
   },
   "encounters": {
     "revealOnEndTurn": "none"
+  },
+  "escape": {
+    "fromRound": 10,
+    "onlyWhenTrapped": false,
+    "sanity": 0
   }
 }

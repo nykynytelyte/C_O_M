@@ -37,6 +37,8 @@ import {
   roomSpecialProblem,
   activeTrait,
   traitProblem,
+  forceWallProblem,
+  forceWallTargets,
   monsterCount,
   stepProblem,
   slotOf,
@@ -157,14 +159,25 @@ function answerChoice(state, ctx) {
  * house as it stands — doors and all.
  */
 function chooseMove(state, ctx, rand) {
-  const destinations = legalDestinations(state, ctx);
-  if (destinations.length === 0) return null;
-
   const me = currentPlayer(state);
   const targets = goals(state, ctx, me);
   if (targets.size === 0) return null;
-
   const here = distanceToGoal(state, ctx, me.pos, targets);
+
+  // Walled off from everything, and the rules allow forcing a wall: take the
+  // wall that leads nearest to where it wants to be.
+  if (here >= 99 && !forceWallProblem(state, ctx)) {
+    const crow = (pos) => Math.min(...[...targets].map((k) => gap(pos, posOf(k))));
+    const options = forceWallTargets(state)
+      .map((to) => ({ to, walk: distanceToGoal(state, ctx, to, targets), crow: crow(to) }))
+      .sort((a, b) => a.walk - b.walk || a.crow - b.crow);
+    if (options.length && (options[0].walk < 99 || options[0].crow < crow(me.pos))) {
+      return { type: 'FORCE_WALL', to: options[0].to };
+    }
+  }
+
+  const destinations = legalDestinations(state, ctx);
+  if (destinations.length === 0) return null;
   let best = [];
   let bestScore = Infinity;
   for (const dest of destinations) {
