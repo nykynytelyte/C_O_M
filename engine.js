@@ -2882,7 +2882,8 @@ function doTrait(state, ctx) {
  *   "escape": { "fromRound": 10, "onlyWhenTrapped": false, "sanity": 1 }
  *
  *   fromRound        the first round it may be used (1 = from the start)
- *   onlyWhenTrapped  only when no door leads out of the investigator's room
+ *   onlyWhenTrapped  'room': only when no door leads out of the investigator's room;
+ *                    'foyer': only when no path through doors leads back to the Foyer
  *   sanity           what it costs in Sanity, on top of one action
  *   clues            what it costs in Clues, on top of one action
  *   passages         it takes a Passage, earned by investigating a Nothing card
@@ -2966,7 +2967,12 @@ export function forceWallProblem(state, ctx) {
   }
   const player = currentPlayer(state);
   if (engagedWith(state, player).length > 0) return 'you are engaged with a monster — Attack or Flee first';
-  if (rule.onlyWhenTrapped && !trappedInRoom(state, ctx, player)) {
+  // Trapped: 'room' (or true) = no door out of this room; 'foyer' = no path
+  // through doors back to the Foyer.
+  if (rule.onlyWhenTrapped === 'foyer' && !isStuck(state, ctx, player, 'foyer')) {
+    return 'you can still walk back to the Foyer, so the walls hold';
+  }
+  if (rule.onlyWhenTrapped && rule.onlyWhenTrapped !== 'foyer' && !trappedInRoom(state, ctx, player)) {
     return 'there is still a door out of this room';
   }
   if (rule.sanity && (player.sanity ?? 0) <= rule.sanity) {
