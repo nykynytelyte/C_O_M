@@ -2897,6 +2897,34 @@ export function trappedInRoom(state, ctx, player) {
   return true;
 }
 
+/**
+ * Stuck, for a forced shift:
+ *   room    no door leads out of the investigator's room
+ *   foyer   no path through doors leads back to the Foyer
+ */
+function isStuck(state, ctx, player, test) {
+  if (test === 'room') return trappedInRoom(state, ctx, player);
+  const open = { ...state, monsters: [], drewThisTurn: false };
+  const home = ctx.scenario.startRoom;
+  const seen = new Set([posKey(player.pos)]);
+  let frontier = [player.pos];
+  while (frontier.length > 0) {
+    const next = [];
+    for (const pos of frontier) {
+      if (roomEntryAt(state, slotOf(pos))?.roomId === home) return false;
+      for (const dir of DIRS) {
+        const to = { gr: pos.gr + dir.dr, gc: pos.gc + dir.dc };
+        if (seen.has(posKey(to)) || !roomEntryAt(state, slotOf(to))) continue;
+        if (stepProblem(open, pos, to, ctx)) continue;
+        seen.add(posKey(to));
+        next.push(to);
+      }
+    }
+    frontier = next;
+  }
+  return true;
+}
+
 /** The squares through a wall from here into a room already on the table. */
 function wallSquares(state, player) {
   const slot = slotOf(player.pos);
@@ -3714,7 +3742,18 @@ function resolveShift(state, round, roller, ctx) {
   let roll = null;
   let occurs;
 
-  if (bar <= 0) {
+  // The house will not keep anyone in for good: while an investigator is
+  // stuck, the shift happens without a roll (shift.forceWhenStuck).
+  const force = cfg.forceWhenStuck;
+  const stuck = force ? onTable(state).filter((p) => isStuck(state, ctx, p, force.test)) : [];
+
+  if (stuck.length > 0) {
+    occurs = true;
+    pushLog(
+      state,
+      `Round ${round}: ${stuck.map((p) => p.name).join(' and ')} ${stuck.length === 1 ? 'is' : 'are'} cut off, so the house shifts without a roll.`,
+    );
+  } else if (bar <= 0) {
     occurs = true;
     pushLog(
       state,
@@ -3738,10 +3777,19 @@ function resolveShift(state, round, roller, ctx) {
 
   state.shiftPressure = 0;
   const rotated = [];
-  const slot = slotOf(roller.pos);
+  // Normally the rooms around the roller turn; a forced shift may instead turn
+  // the rooms around whoever is stuck.
+  const centres =
+    stuck.length > 0 && force.centre === 'stuck' ? stuck.map((p) => slotOf(p.pos)) : [slotOf(roller.pos)];
+  const around = new Map();
+  for (const slot of centres) {
+    for (const dir of DIRS) {
+      const near = { R: slot.R + dir.dr, C: slot.C + dir.dc };
+      around.set(roomKey(near.R, near.C), near);
+    }
+  }
 
-  for (const dir of DIRS) {
-    const near = { R: slot.R + dir.dr, C: slot.C + dir.dc };
+  for (const near of around.values()) {
     const entry = roomEntryAt(state, near);
     if (!entry) continue;
     const room = ctx.rooms[entry.roomId];

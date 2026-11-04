@@ -666,4 +666,29 @@ const ctx = { scenario, rooms, entrances, encounterCards, items, events, investi
   assert.equal(out.players[0].clues, 1, 'an extra card is a Clue like any other');
 }
 
+/* ------------------------------------------------------------------ *
+ * Optional: a forced shift while someone is cut off (off by default)
+ * ------------------------------------------------------------------ */
+{
+  assert.equal(ctx.scenario.shift.forceWhenStuck, undefined, 'off unless the rules ask for it');
+  const forced = {
+    ...ctx,
+    scenario: { ...ctx.scenario, shift: { ...ctx.scenario.shift, forceWhenStuck: { test: 'foyer', centre: 'stuck' } } },
+  };
+  const game = createGame(forced, { seed: 4, playerCount: 1, investigatorIds: ['2'] });
+  // The Study two slots east, with nothing between it and the Foyer: no way home.
+  game.rooms['0,2'] = { roomId: 'study', rot: 0 };
+  game.rooms['0,3'] = { roomId: 'gallery', rot: 0 };
+  game.players[0].pos = { gr: 1, gc: 7 };
+  const after = reduce(game, { type: 'END_TURN' }, forced);
+  assert.equal(after.lastShift.occurred, true, 'cut off from the Foyer: the house shifts');
+  assert.equal(after.lastShift.roll, null, 'without a roll');
+  assert.match(after.log.join('\n'), /cut off, so the house shifts without a roll/);
+  assert.equal(after.rooms['0,3'].rot, 1, 'the rooms around the stuck investigator turn');
+
+  // With a way home, the ordinary roll decides.
+  const free = createGame(forced, { seed: 4, playerCount: 1, investigatorIds: ['2'] });
+  assert.notEqual(reduce(free, { type: 'END_TURN' }, forced).lastShift.roll, null);
+}
+
 console.log('INVESTIGATOR SHEETS OK');
