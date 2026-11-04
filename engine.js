@@ -2888,6 +2888,7 @@ function doTrait(state, ctx) {
  *   clues            what it costs in Clues, on top of one action
  *   passages         it takes a Passage, earned by investigating a Nothing card
  *   passagesEarly    before fromRound a Passage opens a wall; from it, no Passage needed
+ *   passageBypass    when not trapped, a Passage still opens a wall
  *
  * Leave it out and the walls hold.
  * ------------------------------------------------------------------ */
@@ -2952,42 +2953,67 @@ function wallSquares(state, player) {
 
 /** Why the current investigator cannot force a wall, or null. */
 export function forceWallProblem(state, ctx) {
+  return escapeTerms(state, ctx).problem;
+}
+
+/**
+ * Whether the current investigator may force a wall, and whether doing so
+ * spends a Passage. One place decides both, so the check and the payment agree.
+ */
+function escapeTerms(state, ctx) {
   const rule = ctx.scenario.escape;
-  if (!rule) return 'the walls hold in this game';
-  if (state.over) return 'the game is over';
-  if (state.pending) return 'place the drawn room before doing anything else';
-  if (state.choice) return 'answer the choice on the table first';
-  if (state.actionsLeft <= 0) return 'no actions left this turn';
-  // Before the free round, a Passage (from a Nothing card) still opens a wall.
-  const early = state.round < (rule.fromRound ?? 1);
-  if (early && !(rule.passagesEarly && (currentPlayer(state).passages ?? 0) > 0)) {
-    return rule.passagesEarly
-      ? `the walls hold until round ${rule.fromRound} — or use a Passage, found by investigating a Nothing card`
-      : `the walls hold until round ${rule.fromRound}`;
-  }
+  const no = (problem) => ({ problem, passage: false });
+  if (!rule) return no('the walls hold in this game');
+  if (state.over) return no('the game is over');
+  if (state.pending) return no('place the drawn room before doing anything else');
+  if (state.choice) return no('answer the choice on the table first');
+  if (state.actionsLeft <= 0) return no('no actions left this turn');
   const player = currentPlayer(state);
-  if (engagedWith(state, player).length > 0) return 'you are engaged with a monster — Attack or Flee first';
-  // Trapped: 'room' (or true) = no door out of this room; 'foyer' = no path
-  // through doors back to the Foyer.
-  if (rule.onlyWhenTrapped === 'foyer' && !isStuck(state, ctx, player, 'foyer')) {
-    return 'you can still walk back to the Foyer, so the walls hold';
+  if (engagedWith(state, player).length > 0) return no('you are engaged with a monster — Attack or Flee first');
+  const holdsPassage = (player.passages ?? 0) > 0;
+  let passage = false;
+
+  // Too early: a Passage still opens the wall (passagesEarly).
+  if (state.round < (rule.fromRound ?? 1)) {
+    if (rule.passagesEarly && holdsPassage) passage = true;
+    else {
+      return no(
+        rule.passagesEarly
+          ? `the walls hold until round ${rule.fromRound} — or use a Passage, found by investigating a Nothing card`
+          : `the walls hold until round ${rule.fromRound}`,
+      );
+    }
   }
-  if (rule.onlyWhenTrapped && rule.onlyWhenTrapped !== 'foyer' && !trappedInRoom(state, ctx, player)) {
-    return 'there is still a door out of this room';
+
+  // Not trapped: a Passage still opens the wall (passageBypass).
+  const trapped =
+    !rule.onlyWhenTrapped ||
+    (rule.onlyWhenTrapped === 'foyer'
+      ? isStuck(state, ctx, player, 'foyer')
+      : trappedInRoom(state, ctx, player));
+  if (!trapped) {
+    if (rule.passageBypass && holdsPassage) passage = true;
+    else {
+      const why =
+        rule.onlyWhenTrapped === 'foyer'
+          ? 'you can still walk back to the Foyer, so the walls hold'
+          : 'there is still a door out of this room';
+      return no(rule.passageBypass ? `${why} — unless you use a Passage, found by investigating a Nothing card` : why);
+    }
+  }
+
+  if (rule.passages) {
+    if (!holdsPassage) return no('forcing a wall takes a Passage — investigate a Nothing card to find one');
+    passage = true;
   }
   if (rule.sanity && (player.sanity ?? 0) <= rule.sanity) {
-    return `${player.name} has too little Sanity left to force a wall`;
-  }
-  if (rule.passages && (player.passages ?? 0) < 1) {
-    return 'forcing a wall takes a Passage — investigate a Nothing card to find one';
+    return no(`${player.name} has too little Sanity left to force a wall`);
   }
   if (rule.clues && (player.clues ?? 0) < rule.clues) {
-    return `forcing a wall costs ${rule.clues} Clue${rule.clues === 1 ? '' : 's'}`;
+    return no(`forcing a wall costs ${rule.clues} Clue${rule.clues === 1 ? '' : 's'}`);
   }
-  if (wallSquares(state, player).length === 0) {
-    return 'stand against a wall with a room on the other side';
-  }
-  return null;
+  if (wallSquares(state, player).length === 0) return no('stand against a wall with a room on the other side');
+  return { problem: null, passage };
 }
 
 export function forceWallTargets(state) {
@@ -2995,25 +3021,26 @@ export function forceWallTargets(state) {
 }
 
 function doForceWall(state, ctx, to) {
-  const problem = forceWallProblem(state, ctx);
-  if (problem) throw new Error(problem);
+  const terms = escapeTerms(state, ctx);
+  if (terms.problem) throw new Error(terms.problem);
   const player = currentPlayer(state);
   const squares = wallSquares(state, player);
 
   if (to) {
     const target = squares.find((p) => p.gr === to.gr && p.gc === to.gc);
     if (!target) throw new Error('there is no room on the other side of that wall');
-    forceThrough(state, ctx, player, target);
+    forceThrough(state, ctx, player, target, null, terms.passage);
     return state;
   }
   if (squares.length === 1) {
-    forceThrough(state, ctx, player, squares[0]);
+    forceThrough(state, ctx, player, squares[0], null, terms.passage);
     return state;
   }
   beginChoice(state, {
     kind: 'force-wall',
     playerId: player.id,
     prompt: 'Which wall do you force?',
+    passage: terms.passage,
     options: squares.map((p) => ({
       id: posKey(p),
       label: ctx.rooms[roomEntryAt(state, slotOf(p)).roomId].name,
@@ -3022,7 +3049,7 @@ function doForceWall(state, ctx, to) {
   return state;
 }
 
-function forceThrough(state, ctx, player, to, key = null) {
+function forceThrough(state, ctx, player, to, key = null, passage = false) {
   const there = slotOf(to);
   const room = ctx.rooms[roomEntryAt(state, there).roomId];
   player.pos = { ...to };
@@ -3033,7 +3060,7 @@ function forceThrough(state, ctx, player, to, key = null) {
     const rule = ctx.scenario.escape;
     state.actionsLeft -= 1;
     pushLog(state, `${player.name} forces a way through the wall into the ${room.name}.`);
-    if (rule.passages || (rule.passagesEarly && state.round < (rule.fromRound ?? 1))) {
+    if (passage) {
       player.passages -= 1;
       pushLog(state, `${player.name} uses a Passage.`);
     }
@@ -3351,7 +3378,7 @@ function resolveChoice(state, ctx, choice, picked) {
   }
 
   if (choice.kind === 'force-wall') {
-    forceThrough(state, ctx, chooser, posOfKey(String(picked.id)), choice.key ?? null);
+    forceThrough(state, ctx, chooser, posOfKey(String(picked.id)), choice.key ?? null, Boolean(choice.passage));
     return;
   }
 
@@ -4113,7 +4140,8 @@ function collectEncounter(state, ctx, key) {
   if (marker.type === 'nothing') {
     // A Nothing card may still show the way through: with the 'passages' rule,
     // the investigator notices a draft and keeps a Passage to force a wall.
-    if (ctx.scenario.escape?.passages || ctx.scenario.escape?.passagesEarly) {
+    const esc = ctx.scenario.escape;
+    if (esc?.passages || esc?.passagesEarly || esc?.passageBypass) {
       player.passages = (player.passages ?? 0) + 1;
       pushLog(state, `Nothing here — but ${player.name} feels a draft through the wall and keeps a Passage.`);
     } else {

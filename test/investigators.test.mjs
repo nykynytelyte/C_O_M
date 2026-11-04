@@ -601,37 +601,73 @@ const ctx = { scenario, rooms, entrances, encounterCards, items, events, investi
 }
 
 /* ------------------------------------------------------------------ *
- * Forcing a wall: from round 10, as an action
+ * Forcing a wall
+ *
+ * The rule as played: cut off from the Foyer, you may step through a wall
+ * as an action; a Passage (found under a Nothing card) lets anyone do it.
  * ------------------------------------------------------------------ */
 {
-  assert.deepEqual(ctx.scenario.escape, { fromRound: 10, onlyWhenTrapped: false, sanity: 0 });
+  assert.deepEqual(ctx.scenario.escape, {
+    fromRound: 1,
+    onlyWhenTrapped: 'foyer',
+    passageBypass: true,
+    sanity: 0,
+  });
 
-  const game = createGame(ctx, { seed: 9, playerCount: 2, investigatorIds: ['1', '2'] });
-  game.entranceDeck = ['17'];
-  game.rooms['0,1'] = { roomId: 'study', rot: 0 }; // east of the Foyer
-  game.players[0].pos = { gr: 0, gc: 2 }; // the Foyer's north-east corner
-  assert.match(forceWallProblem(game, ctx), /until round 10/, 'the walls hold early on');
+  const base = createGame(ctx, { seed: 9, playerCount: 2, investigatorIds: ['1', '2'] });
+  base.entranceDeck = ['17'];
+  base.rooms['0,1'] = { roomId: 'study', rot: 0 }; // east of the Foyer; no door back west
 
+  // In the Foyer, against its east wall: there is a way home, so the walls hold...
+  const home = structuredClone(base);
+  home.players[0].pos = { gr: 1, gc: 2 };
+  assert.match(forceWallProblem(home, ctx), /walk back to the Foyer.*unless you use a Passage/);
+  // ...unless a Passage is spent.
+  home.players[0].passages = 1;
+  const shortcut = reduce(home, { type: 'FORCE_WALL' }, ctx);
+  assert.deepEqual(shortcut.players[0].pos, { gr: 1, gc: 3 }, 'through into the Study');
+  assert.equal(shortcut.players[0].passages, 0, 'the Passage is spent');
+  assert.equal(shortcut.actionsLeft, home.actionsLeft - 1, 'and an action');
+
+  // Shut in the Study, with no door back to the Foyer: the wall gives, for an action.
+  const shut = structuredClone(base);
+  shut.players[0].pos = { gr: 1, gc: 3 };
+  assert.equal(forceWallProblem(shut, ctx), null, 'cut off from the Foyer, any round');
+  const out = reduce(shut, { type: 'FORCE_WALL' }, ctx);
+  assert.deepEqual(out.players[0].pos, { gr: 1, gc: 2 }, 'back into the Foyer');
+  assert.equal(out.actionsLeft, shut.actionsLeft - 1);
+  assert.equal(out.players[0].sanity, shut.players[0].sanity, 'and nothing else');
+
+  // A Nothing card gives a Passage under this rule.
+  const found = structuredClone(base);
+  found.players[0].ability = null;
+  found.encounters['1,0'] = { entranceId: '17', room: '0,0', number: 4, cardId: '13', type: 'nothing', faceUp: true };
+  found.players[0].pos = { gr: 1, gc: 0 };
+  const draft = reduce(found, { type: 'INVESTIGATE' }, ctx);
+  assert.equal(draft.players[0].passages, 1, 'investigating Nothing finds a Passage');
+
+  // The older variants stay available to a scenario: anyone, from round 10.
+  const anyone = { ...ctx, scenario: { ...ctx.scenario, escape: { fromRound: 10, onlyWhenTrapped: false, sanity: 0 } } };
+  const game = structuredClone(base);
+  game.players[0].pos = { gr: 0, gc: 2 };
+  assert.match(forceWallProblem(game, anyone), /until round 10/, 'the walls hold early on');
   game.round = 10;
-  assert.equal(forceWallProblem(game, ctx), null);
-  const through = reduce(game, { type: 'FORCE_WALL' }, ctx);
+  const through = reduce(game, { type: 'FORCE_WALL' }, anyone);
   assert.deepEqual(through.players[0].pos, { gr: 0, gc: 3 }, 'straight through into the Study');
-  assert.equal(through.actionsLeft, game.actionsLeft - 1, 'it costs an action');
-  assert.equal(through.players[0].sanity, game.players[0].sanity, 'and nothing else');
   assert.equal(through.lastEntrance?.slot, '0,1', 'entering the room turns its card');
 
   // Standing in the middle of a room there is no wall to push through.
   const middle = structuredClone(game);
   middle.players[0].pos = { gr: 1, gc: 1 };
-  assert.match(forceWallProblem(middle, ctx), /stand against a wall/);
+  assert.match(forceWallProblem(middle, anyone), /stand against a wall/);
 
   // In a corner with rooms on two sides, the player chooses.
   const corner = structuredClone(game);
   corner.rooms['-1,0'] = { roomId: 'gallery', rot: 0 };
-  const asked = reduce(corner, { type: 'FORCE_WALL' }, ctx);
+  const asked = reduce(corner, { type: 'FORCE_WALL' }, anyone);
   assert.equal(asked.choice?.kind, 'force-wall');
   const north = asked.choice.options.find((o) => o.label === 'Gallery');
-  const done = reduce(asked, { type: 'CHOOSE', optionId: north.id }, ctx);
+  const done = reduce(asked, { type: 'CHOOSE', optionId: north.id }, anyone);
   assert.deepEqual(done.players[0].pos, { gr: -1, gc: 2 });
 
   // The Antique Key opens a wall at any time, for no action.
