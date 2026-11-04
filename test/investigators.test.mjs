@@ -434,10 +434,11 @@ const ctx = { scenario, rooms, entrances, encounterCards, items, events, investi
 
   // What is still waiting, and what it is waiting for.
   const waiting = createGame(ctx, { seed: 41, playerCount: 2, investigatorIds: ['1', '2'] });
-  waiting.players[0].items = ['22', '9', '10', '13'];
+  waiting.players[0].items = ['22', '9', '10', '13', '14'];
   assert.match(useItemProblem(waiting, ctx, '9'), /no monster on or next to/);
   assert.match(useItemProblem(waiting, ctx, '10'), /no monster on or next to/);
-  assert.match(useItemProblem(waiting, ctx, '13'), /needs a lock/);
+  assert.match(useItemProblem(waiting, ctx, '13'), /stand against a wall/, 'the Antique Key needs a wall');
+  assert.match(useItemProblem(waiting, ctx, '14'), /needs a die roll/);
   assert.equal(useItemProblem(waiting, ctx, '22') ?? null, null, 'Dark Dice is no longer waiting for dice');
 
   // No card in either deck still claims to be waiting on Health or Sanity.
@@ -632,6 +633,36 @@ const ctx = { scenario, rooms, entrances, encounterCards, items, events, investi
   const north = asked.choice.options.find((o) => o.label === 'Gallery');
   const done = reduce(asked, { type: 'CHOOSE', optionId: north.id }, ctx);
   assert.deepEqual(done.players[0].pos, { gr: -1, gc: 2 });
+
+  // The Antique Key opens a wall at any time, for no action.
+  const keyed = structuredClone(game);
+  keyed.round = 1;
+  keyed.players[0].items = ['13'];
+  const opened = reduce(keyed, { type: 'USE_ITEM', itemId: '13' }, ctx);
+  assert.deepEqual(opened.players[0].pos, { gr: 0, gc: 3 }, 'the Key opens the wall into the Study');
+  assert.equal(opened.actionsLeft, keyed.actionsLeft, 'and costs no action');
+  assert.deepEqual(opened.players[0].items, [], 'the Key is spent');
+
+  // A Clue cost, when the rules set one.
+  const priced = { ...ctx, scenario: { ...ctx.scenario, escape: { fromRound: 1, clues: 1 } } };
+  const poor = structuredClone(game);
+  poor.round = 1;
+  assert.match(forceWallProblem(poor, priced), /costs 1 Clue/);
+  poor.players[0].clues = 2;
+  assert.equal(reduce(poor, { type: 'FORCE_WALL' }, priced).players[0].clues, 1, 'a Clue is spent');
+
+  // Passages: a Nothing card shows a way through, usable before round 10.
+  const drafty = { ...ctx, scenario: { ...ctx.scenario, escape: { fromRound: 10, passagesEarly: true } } };
+  const early = structuredClone(game);
+  early.round = 3;
+  assert.match(forceWallProblem(early, drafty), /use a Passage/);
+  early.players[0].passages = 1;
+  const slipped = reduce(early, { type: 'FORCE_WALL' }, drafty);
+  assert.deepEqual(slipped.players[0].pos, { gr: 0, gc: 3 });
+  assert.equal(slipped.players[0].passages, 0, 'a Passage is spent before round 10');
+  const late = structuredClone(game);
+  late.players[0].passages = 1;
+  assert.equal(reduce(late, { type: 'FORCE_WALL' }, drafty).players[0].passages, 1, 'from round 10 it is free');
 
   // A scenario may switch it off.
   const walled = buildScenario(core, { id: 't', name: 'T', rules: { escape: null } });

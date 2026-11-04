@@ -171,6 +171,12 @@ function chooseMove(state, ctx, rand) {
   if (targets.size === 0) return null;
   const here = distanceToGoal(state, ctx, me.pos, targets);
 
+  // Walled off from everything with a key in hand: use it.
+  if (here >= 99) {
+    const key = (me.items ?? []).find((id) => ctx.items?.[id]?.effect.forceWall && !useItemProblem(state, ctx, id));
+    if (key) return { type: 'USE_ITEM', itemId: key };
+  }
+
   // Walled off from everything, and the rules allow forcing a wall: take the
   // wall that leads nearest to where it wants to be.
   if (here >= 99 && !forceWallProblem(state, ctx)) {
