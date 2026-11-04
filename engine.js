@@ -1938,7 +1938,19 @@ export function pendingOrientations(state, ctx) {
  * Actions
  * ------------------------------------------------------------------ */
 
-export const ACTIONS = ['MOVE', 'INVESTIGATE', 'USE_ITEM', 'PLACE_ROOM', 'CHOOSE', 'END_TURN'];
+export const ACTIONS = [
+  'MOVE',
+  'INVESTIGATE',
+  'USE_ITEM',
+  'PLACE_ROOM',
+  'CHOOSE',
+  'END_TURN',
+  'ATTACK',
+  'FLEE',
+  'SEAL',
+  'ROOM_SPECIAL',
+  'USE_TRAIT',
+];
 
 /**
  * Apply one action and return the new state. Never mutates `state`.

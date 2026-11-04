@@ -460,4 +460,15 @@ const riftOpen = (game) => {
   );
 }
 
+/* ------------------------------------------------------------------ *
+ * The test bot plays whole games without ever asking for an illegal move
+ * ------------------------------------------------------------------ */
+{
+  const { simulate } = await import('../sim/run.mjs');
+  for (const players of [1, 3]) {
+    const games = simulate(ctx, { games: 6, players, seed: 5 });
+    for (const g of games) assert.equal(g.error, null, `bot game seed ${g.seed}: ${g.error}`);
+  }
+}
+
 console.log('\nSCENARIO I OK');
