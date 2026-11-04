@@ -624,44 +624,43 @@ function round(state) {
  * ------------------------------------------------------------------ */
 
 {
-  // Higher than five to begin with, then one easier every round the house stands
-  // still: a 6, then 5+, 4+, 3+, 2+, and automatic once the bar reaches zero,
-  // which a d6 always beats because it never rolls below one.
+  // The rulebook's Method A: 5+ to begin with, each failed roll adds a Shift
+  // Point to the next one — so 4+, 3+, 2+ — and the fifth round shifts on its own.
   assert.deepEqual(
     scenario.shift.ladder,
-    [5, 4, 3, 2, 1, 0],
-    'the shift bar should start at higher than five and drop one a round',
+    [4, 3, 2, 1, 0],
+    'the shift bar should start at 5+ and drop one a round',
   );
 
   let caseA = null;
   for (let seed = 1; seed <= 4000 && !caseA; seed++) {
     let state = createGame(ctx, { seed, playerCount: 2 });
     const shifts = [];
-    for (let round = 0; round < 6; round++) {
+    for (let round = 0; round < 5; round++) {
       state = reduce(state, { type: 'END_TURN' }, ctx);
       state = reduce(state, { type: 'END_TURN' }, ctx);
       shifts.push({ ...state.lastShift });
     }
-    if (shifts.slice(0, 5).every((shift) => !shift.occurred)) caseA = { state, shifts };
+    if (shifts.slice(0, 4).every((shift) => !shift.occurred)) caseA = { state, shifts };
   }
 
-  assert.ok(caseA, 'some game should stand still for five rounds, to see the whole bar');
+  assert.ok(caseA, 'some game should stand still for four rounds, to see the whole bar');
   assert.deepEqual(
     caseA.shifts.map((shift) => shift.needed),
-    [6, 5, 4, 3, 2, null],
-    'the bar must slide 6+, 5+, 4+, 3+, 2+, then automatic',
+    [5, 4, 3, 2, null],
+    'the bar must slide 5+, 4+, 3+, 2+, then automatic',
   );
-  for (const shift of caseA.shifts.slice(0, 5)) {
+  for (const shift of caseA.shifts.slice(0, 4)) {
     assert.ok(shift.roll >= 1 && shift.roll <= 6, 'a shift roll is a d6');
     assert.ok(shift.roll < shift.needed, `a roll of ${shift.roll} must not beat ${shift.needed}+`);
   }
-  assert.equal(caseA.shifts[5].occurred, true, 'the sixth round must shift of its own accord');
-  assert.equal(caseA.shifts[5].roll, null, 'an automatic shift is not rolled');
+  assert.equal(caseA.shifts[4].occurred, true, 'the fifth round must shift of its own accord');
+  assert.equal(caseA.shifts[4].roll, null, 'an automatic shift is not rolled');
 
   // A shift of any kind puts the bar straight back to the top.
   let after = reduce(caseA.state, { type: 'END_TURN' }, ctx);
   after = reduce(after, { type: 'END_TURN' }, ctx);
-  assert.equal(after.lastShift.needed, 6, 'a shift must reset the bar to higher than five');
+  assert.equal(after.lastShift.needed, 5, 'a shift must reset the bar to 5+');
 }
 
 {
@@ -997,7 +996,7 @@ function round(state) {
   state = reduce(state, { type: 'END_TURN' }, ctx);
   assert.equal(
     state.lastShift.needed,
-    5,
+    4,
     'the round-end roll must use the bar the Shift Point left behind',
   );
 
@@ -1133,7 +1132,7 @@ function round(state) {
 }
 
 /* ------------------------------------------------------------------ *
- * Every entry draws a room entrance card, including coming back
+ * Entering a room draws a room entrance card — once per player per turn
  * ------------------------------------------------------------------ */
 
 {
@@ -1144,9 +1143,20 @@ function round(state) {
   state = reduce(state, { type: 'PLACE_ROOM', orient: pendingOrientations(state, ctx)[0] }, ctx);
   assert.equal(state.lastEntrance.slot, '-1,0', 'stepping into a new room turns its card');
   const drawn = state.entranceSeen.length;
+  const rot = state.rooms['-1,0'].rot;
 
+  // "Each player may only trigger 1 Room Entrance Card per turn."
   state = reduce(state, { type: 'MOVE', path: [{ gr: 0, gc: 1 }] }, ctx);
-  assert.equal(state.lastEntrance?.slot, '0,0', 'walking back into the foyer turns a card too');
+  assert.equal(state.lastEntrance, null, 'walking back in the same turn turns no card');
+  assert.equal(state.entranceSeen.length, drawn, 'nothing more came off the deck');
+  assert.match(state.log.join('\n'), /already been drawn this turn/);
+
+  // A new turn, and walking into a room already on the table draws again.
+  state = reduce(state, { type: 'END_TURN' }, ctx);
+  state = reduce(state, { type: 'END_TURN' }, ctx);
+  state.rooms['-1,0'].rot = rot; // undo any shift, so the doorway still lines up
+  state = reduce(state, { type: 'MOVE', path: [{ gr: -1, gc: 1 }] }, ctx);
+  assert.equal(state.lastEntrance?.slot, '-1,0', 'coming back on a later turn turns a card');
   assert.equal(state.entranceSeen.length, drawn + 1, 'a second card came off the deck');
   assert.match(state.log.join('\n'), /Room entrance —/, 'the card is applied, not just counted');
   assert.equal(

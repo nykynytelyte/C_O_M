@@ -10,7 +10,7 @@
   "shift": {
     "method": "A",
     "die": 6,
-    "ladder": [5, 4, 3, 2, 1, 0],
+    "ladder": [4, 3, 2, 1, 0],
     "degrees": 90,
     "affects": "orthogonal-neighbours-of-roller",
     "exemptRooms": ["foyer"]

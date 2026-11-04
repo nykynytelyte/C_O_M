@@ -1625,6 +1625,7 @@ export function createGame(ctx, options = {}) {
     encounterReveal: revealMode(scenario),
     shiftPressure: 0,
     drewThisTurn: false,
+    entranceThisTurn: false,
     lastShift: null,
     players: Array.from({ length: count }, (_, i) => {
       const sheet = seats ? sheets[seats[i]] : null;
@@ -3186,6 +3187,7 @@ function doEndTurn(state, ctx) {
   state.actionsLeft = 0;
   state.stepsLeft = 0;
   state.drewThisTurn = false;
+  state.entranceThisTurn = false;
   // Movement bought with an item lasts one turn, so the allowance goes back to
   // what the scenario printed before the next investigator starts.
   state.moveRange = ctx.scenario.turn.moveRange;
@@ -3713,6 +3715,13 @@ function rotateEncounterCards(state, slot) {
 function resolveEntrance(state, ctx, slot, entry) {
   state.lastEntrance = null;
   if (!ctx.entrances) return;
+
+  // "Each player may only trigger 1 Room Entrance Card per turn."
+  if (state.entranceThisTurn) {
+    pushLog(state, 'A Room Entrance card has already been drawn this turn, so none is drawn here.');
+    return;
+  }
+  state.entranceThisTurn = true;
 
   const id = drawEntrance(state);
   if (!id) return;
