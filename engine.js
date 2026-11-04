@@ -168,6 +168,16 @@ function parseEdgeDoors(value, id, dir) {
  * Turn the rooms CSV into a map of id -> room card.
  * Expected columns: id, name, n, e, s, w, text.
  */
+/**
+ * What a room lets you do while you stand in it. A room card names one of
+ * these in its `special` column; standing in the room, it costs an action.
+ *
+ *   clue-for-sanity   spend 1 Clue to regain 1 Sanity (the Library of Azrel)
+ */
+const ROOM_SPECIALS = {
+  'clue-for-sanity': { label: 'Spend 1 Clue to regain 1 Sanity' },
+};
+
 export function roomsFromCsv(text) {
   const [header, ...rows] = parseCsv(text);
   if (!header) throw new Error('rooms CSV is empty');
@@ -181,6 +191,7 @@ export function roomsFromCsv(text) {
   const iId = column('id');
   const iName = column('name');
   const iText = column('text');
+  const iSpecial = header.indexOf('special');
   const iDoors = Object.fromEntries(DIR_KEYS.map((dir) => [dir, column(dir)]));
 
   const rooms = {};
@@ -205,12 +216,20 @@ export function roomsFromCsv(text) {
     }
     seenNames.set(name, id);
 
+    const special = iSpecial === -1 ? '' : (row[iSpecial] ?? '').trim();
+    if (special && !ROOM_SPECIALS[special]) {
+      throw new Error(
+        `room "${id}" has the special "${special}", which is not one of ${Object.keys(ROOM_SPECIALS).join(', ')}`,
+      );
+    }
+
     rooms[id] = {
       id,
       name,
       doors,
       openings,
       text: (row[iText] ?? '').trim(),
+      special: special || null,
     };
   }
 
@@ -1903,7 +1922,7 @@ export function reduce(state, action, ctx) {
 
   // "While engaged, you may only Attack or Flee." Items cost no action and the
   // turn can still be ended.
-  if (['MOVE', 'INVESTIGATE', 'SEAL'].includes(action.type)) {
+  if (['MOVE', 'INVESTIGATE', 'SEAL', 'ROOM_SPECIAL'].includes(action.type)) {
     const held = engagedWith(next, currentPlayer(next));
     if (held.length > 0) {
       throw new Error(
@@ -1934,6 +1953,9 @@ export function reduce(state, action, ctx) {
       break;
     case 'SEAL':
       out = doSeal(next, ctx);
+      break;
+    case 'ROOM_SPECIAL':
+      out = doRoomSpecial(next, ctx);
       break;
     case 'ATTACK':
       out = doCombat(next, ctx, 'attack', action.monsterId);
@@ -2573,6 +2595,51 @@ function doSeal(state, ctx) {
   if (state.sealClues >= target) {
     state.over = { result: 'won', reason: 'The Rift is sealed.' };
     pushLog(state, ctx.scenario.story?.sealed ?? 'The Rift is sealed.');
+  }
+  return state;
+}
+
+/* ------------------------------------------------------------------ *
+ * Room specials
+ * ------------------------------------------------------------------ */
+
+/** The room the current investigator stands in, if it has a special. */
+export function roomSpecialHere(state, ctx) {
+  const entry = roomEntryAt(state, slotOf(currentPlayer(state).pos));
+  const room = entry ? ctx.rooms[entry.roomId] : null;
+  return room?.special ? { room, ...ROOM_SPECIALS[room.special] } : null;
+}
+
+/** Why the current investigator cannot use the room they stand in, or null. */
+export function roomSpecialProblem(state, ctx) {
+  const here = roomSpecialHere(state, ctx);
+  if (!here) return 'there is nothing special about this room';
+  if (state.over) return 'the game is over';
+  if (state.pending) return 'place the drawn room before doing anything else';
+  if (state.choice) return 'answer the choice on the table first';
+  if (state.actionsLeft <= 0) return 'no actions left this turn';
+  const player = currentPlayer(state);
+  if (engagedWith(state, player).length > 0) return 'you are engaged with a monster — Attack or Flee first';
+
+  if (here.room.special === 'clue-for-sanity') {
+    if ((player.clues ?? 0) < 1) return `${player.name} has no Clue to spend`;
+    if (typeof player.sanity !== 'number') return `${player.name} has no Sanity on their sheet`;
+    if (player.sanity >= player.sanityMax) return `${player.name} is already at full Sanity`;
+  }
+  return null;
+}
+
+function doRoomSpecial(state, ctx) {
+  const problem = roomSpecialProblem(state, ctx);
+  if (problem) throw new Error(problem);
+  const { room } = roomSpecialHere(state, ctx);
+  const player = currentPlayer(state);
+  state.actionsLeft -= 1;
+
+  if (room.special === 'clue-for-sanity') {
+    player.clues -= 1;
+    pushLog(state, `${player.name} spends a Clue in the ${room.name}.`);
+    changePool(state, player, 'sanity', 1, `the ${room.name}`);
   }
   return state;
 }

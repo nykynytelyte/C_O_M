@@ -31,6 +31,8 @@ import {
   sealTarget,
   combatProblem,
   engagedWith,
+  roomSpecialHere,
+  roomSpecialProblem,
   useItemProblem,
   doorsAt,
   roomKey,
@@ -78,6 +80,7 @@ async function boot() {
     'seal',
     'attack',
     'flee',
+    'roomuse',
     'flash',
   ]) {
     el[id] = document.getElementById(id);
@@ -134,6 +137,7 @@ async function boot() {
   el.seal.addEventListener('click', () => dispatch({ type: 'SEAL' }));
   el.attack.addEventListener('click', () => dispatch({ type: 'ATTACK' }));
   el.flee.addEventListener('click', () => dispatch({ type: 'FLEE' }));
+  el.roomuse.addEventListener('click', () => dispatch({ type: 'ROOM_SPECIAL' }));
   el.seal.hidden = !ctx.scenario.seal;
   el.newgame.addEventListener('click', () => newGame(true));
   el.copy.addEventListener('click', copyReplay);
@@ -309,6 +313,7 @@ function renderStatus() {
     el.seal.disabled = true;
     el.attack.disabled = true;
     el.flee.disabled = true;
+    el.roomuse.hidden = true;
     return;
   }
 
@@ -320,6 +325,14 @@ function renderStatus() {
       (kind === 'attack'
         ? 'Attack a monster on or next to your square. Roll 1d6: 4-6 hits, 1-3 misses and you take 1 damage. Costs one action.'
         : 'Break away from a monster you are engaged with. Roll 1d6: 4+ escapes, 1-3 fails and you take 1 damage. Costs one action.');
+  }
+  const special = roomSpecialHere(state, ctx);
+  el.roomuse.hidden = !special;
+  if (special) {
+    const problem = roomSpecialProblem(state, ctx);
+    el.roomuse.textContent = `${special.room.name}: ${special.label}`;
+    el.roomuse.disabled = Boolean(problem);
+    el.roomuse.title = problem ?? `${special.label}. Costs one action.`;
   }
   const holding = engagedWith(state, currentPlayer(state));
 

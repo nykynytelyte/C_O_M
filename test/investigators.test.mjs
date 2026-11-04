@@ -15,6 +15,7 @@ import {
   currentPlayer,
   pendingOrientations,
   useItemProblem,
+  roomSpecialProblem,
   investigatorsFromCsv,
   roomsFromCsv,
   entrancesFromCsv,
@@ -453,6 +454,41 @@ const ctx = { scenario, rooms, entrances, encounterCards, items, events, investi
   }
 
   assert.equal(currentPlayer(healed).name, 'Clara Holt', 'the reader was a sheet');
+}
+
+/* ------------------------------------------------------------------ *
+ * The Library of Azrel: spend 1 Clue to regain 1 Sanity
+ * ------------------------------------------------------------------ */
+{
+  const rooms = ctx.rooms;
+  assert.equal(rooms['library-of-azrel'].special, 'clue-for-sanity');
+  assert.equal(rooms.foyer.special, null, 'an ordinary room has no special');
+  assert.throws(
+    () => roomsFromCsv('id,name,n,e,s,w,text,special\nx,X,1,1,1,1,,fly'),
+    /not one of/,
+  );
+
+  const game = createGame(ctx, { seed: 5, playerCount: 2, investigatorIds: ['1', '2'] });
+  const me = game.players[0];
+  me.clues = 2;
+  me.sanity = 3;
+  assert.match(roomSpecialProblem(game, ctx), /nothing special/, 'not in the Foyer');
+
+  game.rooms['0,1'] = { roomId: 'library-of-azrel', rot: 0 };
+  me.pos = { gr: 1, gc: 4 };
+  assert.equal(roomSpecialProblem(game, ctx), null);
+
+  const read = reduce(game, { type: 'ROOM_SPECIAL' }, ctx);
+  assert.equal(read.players[0].clues, 1, 'a Clue is spent');
+  assert.equal(read.players[0].sanity, 4, 'and a point of Sanity regained');
+  assert.equal(read.actionsLeft, game.actionsLeft - 1, 'it takes an action');
+
+  const empty = structuredClone(game);
+  empty.players[0].clues = 0;
+  assert.match(roomSpecialProblem(empty, ctx), /no Clue/);
+  const whole = structuredClone(game);
+  whole.players[0].sanity = whole.players[0].sanityMax;
+  assert.match(roomSpecialProblem(whole, ctx), /full Sanity/, 'no Clue is wasted at full Sanity');
 }
 
 console.log('INVESTIGATOR SHEETS OK');
