@@ -47,5 +47,5 @@
     "monsterDamage": 1,
     "bossDamage": 2
   },
-  "monsterMovement": "none"
+  "monsterMovement": "hunt"
 }
