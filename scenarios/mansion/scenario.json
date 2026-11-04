@@ -1,26 +1,14 @@
 {
   "id": "mansion",
   "name": "The Mansion",
-  "version": 4,
-  "startSlot": [0, 0],
-  "startSpace": [1, 1],
-  "startRoom": "foyer",
+  "version": 5,
+  "placeholder": true,
+  "story": {
+    "intro": "Placeholder scenario. The real story, monsters and endgame go here."
+  },
   "bossRoom": "rift-room",
   "bossRoomAppearsLast": true,
-  "players": { "min": 1, "max": 4, "default": 2 },
-  "turn": {
-    "actionsPerTurn": 2,
-    "moveRange": 2
-  },
-  "shift": {
-    "method": "A",
-    "die": 6,
-    "ladder": [5, 4, 3, 2, 1, 0],
-    "degrees": 90,
-    "affects": "orthogonal-neighbours-of-roller",
-    "exemptRooms": ["foyer"]
-  },
-  "encounters": {
-    "revealOnEndTurn": "none"
-  }
+  "monsters": [],
+  "endgame": null,
+  "rules": {}
 }

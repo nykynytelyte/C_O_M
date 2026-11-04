@@ -12,6 +12,7 @@
  */
 
 import {
+  buildScenario,
   createGame,
   reduce,
   legalDestinations,
@@ -65,14 +66,16 @@ async function boot() {
     'newgame',
     'copy',
     'diag',
+    'story',
     'flash',
   ]) {
     el[id] = document.getElementById(id);
   }
 
   try {
-    const [scenario, roomsText, entranceText, encounterText, itemText, eventText, sheetText] =
+    const [core, scenarioData, roomsText, entranceText, encounterText, itemText, eventText, sheetText] =
       await Promise.all([
+        fetchJson('./rules/core.json'),
         fetchJson('./scenarios/mansion/scenario.json'),
         fetchText('./decks/rooms.csv'),
         fetchText('./decks/entrance.csv'),
@@ -82,7 +85,7 @@ async function boot() {
         fetchText('./decks/investigators.csv'),
       ]);
     ctx = {
-      scenario,
+      scenario: buildScenario(core, scenarioData),
       rooms: roomsFromCsv(roomsText),
       entrances: entrancesFromCsv(entranceText),
       encounterCards: encountersFromCsv(encounterText),
@@ -94,6 +97,8 @@ async function boot() {
     el.status.textContent = `Could not load the scenario: ${err.message}`;
     return;
   }
+
+  el.story.textContent = ctx.scenario.story?.intro ?? '';
 
   el.players.innerHTML = '';
   for (let n = ctx.scenario.players.min; n <= ctx.scenario.players.max; n++) {
@@ -272,6 +277,15 @@ function renderStatus() {
   const markers = Object.values(state.encounters ?? {});
   const faceDown = markers.filter((marker) => !marker.faceUp).length;
 
+  if (state.over) {
+    el.status.innerHTML =
+      `<span class="stat"><b>Round</b> ${state.round}</span>` +
+      `<span class="stat over"><b>Game over</b> ${state.over.reason}</span>`;
+    el.endturn.disabled = true;
+    el.investigate.disabled = true;
+    return;
+  }
+
   el.status.innerHTML =
     `<span class="stat"><b>Round</b> ${state.round}</span>` +
     `<span class="stat"><b>Turn</b> ${player.name}</span>` +
@@ -430,7 +444,16 @@ function buildSpaces(R, C, isRoom) {
       }
 
       if (isRoom) {
+        for (const monster of state.monsters ?? []) {
+          if (monster.pos.gr !== gr || monster.pos.gc !== gc) continue;
+          const token = document.createElement('span');
+          token.className = 'token monster';
+          token.textContent = 'M';
+          token.title = monster.name;
+          space.appendChild(token);
+        }
         state.players.forEach((player, index) => {
+          if (player.out) return;
           if (player.pos.gr !== gr || player.pos.gc !== gc) return;
           const token = document.createElement('span');
           token.className = `token p${(index % 4) + 1}`;
@@ -519,7 +542,8 @@ function renderChoice() {
   el.pending.innerHTML = '';
 
   const heading = document.createElement('h2');
-  heading.textContent = 'A choice to make';
+  heading.textContent =
+    choice.kind === 'new-investigator' ? 'A new investigator' : 'A choice to make';
   heading.setAttribute('tabindex', '-1');
   el.pending.appendChild(heading);
 
@@ -566,10 +590,11 @@ function renderParty() {
   for (const [index, player] of state.players.entries()) {
     const sheet = ctx.investigators?.[player.investigatorId];
     const block = document.createElement('div');
-    block.className = index === state.turnIndex ? 'investigator turn' : 'investigator';
+    block.className =
+      player.out ? 'investigator out' : index === state.turnIndex ? 'investigator turn' : 'investigator';
 
     const name = document.createElement('h3');
-    name.textContent = player.name;
+    name.textContent = player.out ? `${player.name} — out of the game` : player.name;
     block.appendChild(name);
 
     if (sheet?.role) {

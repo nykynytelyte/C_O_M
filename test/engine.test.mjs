@@ -10,6 +10,7 @@ import { readFile } from 'node:fs/promises';
 import assert from 'node:assert/strict';
 
 import {
+  buildScenario,
   createGame,
   reduce,
   replay,
@@ -32,7 +33,11 @@ import {
 
 const here = (relative) => new URL(relative, import.meta.url);
 
-const scenario = JSON.parse(await readFile(here('../scenarios/mansion/scenario.json'), 'utf8'));
+const core = JSON.parse(await readFile(here('../rules/core.json'), 'utf8'));
+const scenario = buildScenario(
+  core,
+  JSON.parse(await readFile(here('../scenarios/mansion/scenario.json'), 'utf8')),
+);
 const rooms = roomsFromCsv(await readFile(here('../decks/rooms.csv'), 'utf8'));
 const entrances = entrancesFromCsv(
   await readFile(here('../decks/entrance.csv'), 'utf8'),
@@ -2181,4 +2186,43 @@ console.log(`  rooms placed     ${totalPlacements}`);
 console.log(`  shifts triggered ${totalShifts}`);
 console.log(`  mean rooms open  ${(roomsUsed / GAMES).toFixed(1)} of ${TOTAL_ROOMS}`);
 console.log(`  first sealed in  seed ${sealedSeed}, round ${sealedCase.round}`);
+/* ------------------------------------------------------------------ *
+ * Core rules and scenarios
+ * ------------------------------------------------------------------ */
+{
+  // The Foyer is the one steadfast room: every game starts there.
+  assert.equal(scenario.startRoom, 'foyer');
+  assert.ok(scenario.shift.exemptRooms.includes('foyer'), 'the Foyer never turns');
+  assert.equal(scenario.turn.actionsPerTurn, core.turn.actionsPerTurn, 'turns come from the core');
+
+  const base = { id: 'test', name: 'Test' };
+  assert.throws(
+    () => buildScenario(core, { ...base, rules: { startRoom: 'study' } }),
+    /always starts in the foyer/,
+    'a scenario cannot start anywhere but the Foyer',
+  );
+  assert.throws(
+    () => buildScenario(core, { ...base, startRoom: 'study' }),
+    /always starts in the foyer/,
+  );
+  assert.throws(
+    () => buildScenario(core, { ...base, turn: { actionsPerTurn: 3 } }),
+    /goes under "rules"/,
+    'a core rule is only changed through the rules block',
+  );
+
+  // A scenario may bend a core rule, one setting at a time.
+  const harsh = buildScenario(core, {
+    ...base,
+    rules: { turn: { actionsPerTurn: 3 }, shift: { ladder: [3, 2, 1, 0], exemptRooms: [] } },
+  });
+  assert.equal(harsh.turn.actionsPerTurn, 3);
+  assert.equal(harsh.turn.moveRange, core.turn.moveRange, 'what it leaves alone stays core');
+  assert.deepEqual(harsh.shift.ladder, [3, 2, 1, 0]);
+  assert.ok(harsh.shift.exemptRooms.includes('foyer'), 'and the Foyer still never turns');
+  assert.deepEqual(harsh.monsters, []);
+  assert.equal(harsh.endgame, null);
+  assert.equal(core.turn.actionsPerTurn, 2, 'the core rules are not changed by a scenario');
+}
+
 console.log('\nALL INVARIANTS HELD');

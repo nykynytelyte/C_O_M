@@ -266,6 +266,75 @@ function revealMode(scenario) {
   }
   return mode;
 }
+
+/* ------------------------------------------------------------------ *
+ * Core rules and scenarios
+ * ------------------------------------------------------------------ */
+
+/**
+ * The game is the core rules plus one scenario.
+ *
+ * The core rules (rules/core.json) are what every game of Corridors of Madness
+ * shares: two actions a turn, the shift ladder, how many can sit at the table,
+ * and the Foyer. A scenario brings what makes it that scenario — its story, its
+ * monsters, its endgame, the room the story ends in — and may bend a core rule
+ * through its `rules` block, which is laid over the core one section at a time.
+ *
+ * The Foyer is not the scenario's to move. It is the one steadfast room: every
+ * game starts there, and the house never turns it.
+ */
+const STEADFAST_KEYS = ['startRoom', 'startSlot', 'startSpace'];
+
+function isPlainObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function layer(base, over) {
+  if (!isPlainObject(base) || !isPlainObject(over)) return structuredClone(over);
+  const out = structuredClone(base);
+  for (const [key, value] of Object.entries(over)) {
+    out[key] = key in out ? layer(out[key], value) : structuredClone(value);
+  }
+  return out;
+}
+
+export function buildScenario(core, scenario) {
+  if (!core) throw new Error('buildScenario needs the core rules');
+  if (!scenario) throw new Error('buildScenario needs a scenario');
+
+  const overrides = scenario.rules ?? {};
+  for (const key of STEADFAST_KEYS) {
+    if (key in overrides || key in scenario) {
+      throw new Error(
+        `scenario "${scenario.id}" sets ${key}, but the game always starts in the ${core.startRoom}`,
+      );
+    }
+  }
+
+  for (const key of Object.keys(core)) {
+    if (key in scenario && !STEADFAST_KEYS.includes(key)) {
+      throw new Error(
+        `scenario "${scenario.id}" sets ${key} at the top level; a change to a core rule goes under "rules"`,
+      );
+    }
+  }
+
+  const rules = layer(core, overrides);
+  // However a scenario bends the shift, the Foyer stays where it is.
+  const exempt = rules.shift?.exemptRooms ?? [];
+  if (rules.shift && !exempt.includes(rules.startRoom)) {
+    rules.shift.exemptRooms = [rules.startRoom, ...exempt];
+  }
+
+  const { rules: _ignored, ...own } = scenario;
+  return {
+    ...rules,
+    ...own,
+    story: scenario.story ?? null,
+    monsters: scenario.monsters ?? [],
+    endgame: scenario.endgame ?? null,
+  };
+}
 const CORNER_SPACES = [1, 3, 7, 9];
 const EDGE_SPACES = [2, 4, 6, 8];
 const FLIP_RULES = ['end-of-next-round', 'second-player', 'end-turn-adjacent'];
@@ -1048,7 +1117,7 @@ function applyEventOp(state, ctx, op, player) {
   }
 
   if (op.kind === 'swap') {
-    const others = state.players.filter((someone) => someone.id !== player.id);
+    const others = onTable(state).filter((someone) => someone.id !== player.id);
     if (others.length === 0) {
       pushLog(state, 'There is nobody else here to trade places with.');
       return;
@@ -1111,12 +1180,10 @@ function applyEventOp(state, ctx, op, player) {
 
   if (op.kind === 'teleport') {
     if (op.where === 'foyer') {
-      const [startR, startC] = ctx.scenario.startSpace ?? [1, 1];
-      for (const [id, entry] of Object.entries(state.rooms)) {
-        if (entry.roomId !== ctx.scenario.startRoom) continue;
-        const [R, C] = id.split(',').map(Number);
-        player.pos = posOf(R, C, startR, startC);
-        pushLog(state, `${player.name} is back in the ${ctx.rooms[entry.roomId].name}.`);
+      const home = startPosition(state, ctx);
+      if (home) {
+        player.pos = home;
+        pushLog(state, `${player.name} is back in the ${ctx.rooms[ctx.scenario.startRoom].name}.`);
         return;
       }
       pushLog(state, 'The Foyer is not on the table, so there is nowhere to go.');
@@ -1193,9 +1260,9 @@ function rotateRoom(state, ctx, slot) {
   if (!entry) return null;
 
   entry.rot = (entry.rot + 1) % 4;
-  for (const player of state.players) {
-    const at = slotOf(player.pos);
-    if (at.R === slot.R && at.C === slot.C) rotateWithRoom(player, slot);
+  for (const token of [...onTable(state), ...(state.monsters ?? [])]) {
+    const at = slotOf(token.pos);
+    if (at.R === slot.R && at.C === slot.C) rotateWithRoom(token, slot);
   }
   rotateEncounterCards(state, slot);
 
@@ -1210,7 +1277,7 @@ function rotateRoom(state, ctx, slot) {
  */
 function freeSquareIn(state, slot, player) {
   const taken = new Set(
-    state.players.filter((p) => p.id !== player.id).map((p) => posKey(p.pos)),
+    onTable(state).filter((p) => p.id !== player.id).map((p) => posKey(p.pos)),
   );
 
   const free = [];
@@ -1428,6 +1495,12 @@ export function createGame(ctx, options = {}) {
     lastEntrance: null,
     pending: null,
     choice: null,
+    // Who has been played this game, so a fallen investigator is not dealt again.
+    usedInvestigators: seats ? [...seats] : [],
+    // Investigators the house has kept. They stand where they went mad.
+    monsters: [],
+    turnLost: null,
+    over: null,
     log: [],
   };
 
@@ -1632,6 +1705,7 @@ export function reduce(state, action, ctx) {
   if (!action || typeof action.type !== 'string') {
     throw new Error('an action must have a type');
   }
+  if (state.over) throw new Error('the game is over');
   const next = structuredClone(state);
 
   // A card that asks a question owns the table until it is answered.
@@ -1639,22 +1713,151 @@ export function reduce(state, action, ctx) {
     throw new Error('answer the choice on the table before doing anything else');
   }
 
+  let out;
   switch (action.type) {
     case 'CHOOSE':
-      return doChoose(next, action, ctx);
+      out = doChoose(next, action, ctx);
+      break;
     case 'MOVE':
-      return doMove(next, action, ctx);
+      out = doMove(next, action, ctx);
+      break;
     case 'PLACE_ROOM':
-      return doPlace(next, action, ctx);
+      out = doPlace(next, action, ctx);
+      break;
     case 'INVESTIGATE':
-      return doInvestigate(next, ctx);
+      out = doInvestigate(next, ctx);
+      break;
     case 'USE_ITEM':
-      return doUseItem(next, action, ctx);
+      out = doUseItem(next, action, ctx);
+      break;
     case 'END_TURN':
-      return doEndTurn(next, ctx);
+      out = doEndTurn(next, ctx);
+      break;
     default:
       throw new Error(`unknown action type "${action.type}"`);
   }
+  settleCasualties(out, ctx);
+  return out;
+}
+
+/* ------------------------------------------------------------------ *
+ * Casualties
+ * ------------------------------------------------------------------ */
+
+/**
+ * Investigators at 0 Health or 0 Sanity leave the table.
+ *
+ * At 0 Health they have fallen. At 0 Sanity they have gone mad, and the house
+ * keeps them: a monster stands where they stood. Either way, whatever they
+ * carried is lost — clues gone, items to the discard — and the player takes up
+ * a sheet nobody has played yet, starting again in the Foyer. With no sheets
+ * left, that seat is out of the game, and when every seat is out, so is the
+ * game.
+ *
+ * It runs after an action has finished, never in the middle of one, so a card
+ * that hurts and then moves you still does both. If it was the investigator
+ * whose turn it was, the rest of that turn is lost with them.
+ */
+function settleCasualties(state, ctx) {
+  for (;;) {
+    if (state.pending || state.choice || state.over) return;
+
+    const player = state.players.find((p) => p.down && !p.out && !p.replacing);
+    if (!player) break;
+
+    const ownTurn =
+      player.id === currentPlayer(state).id &&
+      player.downDuring === `${state.round}:${state.turnIndex}`;
+    if (ownTurn) state.turnLost = player.id;
+
+    if (player.down === 'mad') {
+      state.monsters ??= [];
+      state.monsters.push({
+        id: `m${state.monsters.length + 1}`,
+        name: `${player.name}, lost to madness`,
+        fromInvestigator: player.investigatorId ?? null,
+        pos: { ...player.pos },
+      });
+      pushLog(state, `${player.name} has gone mad. Where they stood, there is now a monster.`);
+    } else {
+      pushLog(state, `${player.name} has fallen.`);
+    }
+    state.itemDiscard.push(...(player.items ?? []));
+    player.items = [];
+    player.clues = 0;
+
+    const used = new Set(state.usedInvestigators ?? []);
+    const options = Object.values(ctx.investigators ?? {})
+      .filter((sheet) => !used.has(sheet.id))
+      .map((sheet) => ({ id: sheet.id, label: `${sheet.name} — ${sheet.role}` }));
+
+    if (options.length === 0) {
+      player.out = true;
+      pushLog(state, `No one is left to take ${player.name}'s place.`);
+      if (state.players.every((p) => p.out)) {
+        state.over = { result: 'lost', reason: 'Every investigator is gone.' };
+        pushLog(state, 'Every investigator is gone. The house has won.');
+        return;
+      }
+      continue;
+    }
+
+    player.replacing = true;
+    beginChoice(state, {
+      kind: 'new-investigator',
+      playerId: player.id,
+      prompt: `${player.name} is out. Choose a new investigator to take their seat.`,
+      options,
+    });
+    return;
+  }
+
+  // Every casualty is dealt with. If one of them was the investigator whose
+  // turn it was, that turn is over.
+  if (state.turnLost) {
+    const lost = state.turnLost;
+    state.turnLost = null;
+    if (currentPlayer(state).id === lost || currentPlayer(state).out) doEndTurn(state, ctx);
+    settleCasualties(state, ctx);
+  }
+}
+
+/** Seat a fresh investigator in place of one who is out. */
+function seatInvestigator(state, ctx, player, sheet) {
+  state.usedInvestigators = [...(state.usedInvestigators ?? []), sheet.id];
+  Object.assign(player, {
+    name: sheet.name,
+    investigatorId: sheet.id,
+    role: sheet.role,
+    health: sheet.health,
+    healthMax: sheet.health,
+    sanity: sheet.sanity,
+    sanityMax: sheet.sanity,
+    clueLimit: sheet.clueLimit,
+    items: [],
+    clues: 0,
+    pos: startPosition(state, ctx) ?? player.pos,
+  });
+  delete player.down;
+  delete player.downDuring;
+  delete player.replacing;
+  pushLog(state, `${sheet.name} arrives in the Foyer to take up the search.`);
+}
+
+/** The middle of the Foyer, wherever it is on the table. */
+function startPosition(state, ctx) {
+  const [startR, startC] = ctx.scenario.startSpace ?? [1, 1];
+  for (const [id, entry] of Object.entries(state.rooms)) {
+    if (entry.roomId !== ctx.scenario.startRoom) continue;
+    const [R, C] = id.split(',').map(Number);
+    return posOf(R, C, startR, startC);
+  }
+  return null;
+}
+
+/** The investigators still in the game. */
+export function onTable(state) {
+  return state.players.filter((p) => !p.out);
 }
 
 function doMove(state, action, ctx) {
@@ -1786,9 +1989,9 @@ function doUseItem(state, action, ctx) {
 /**
  * Move one pool — Health or Sanity — and say what happened.
  *
- * Nothing is invented at zero. The rulebook has not said what a collapsed
- * investigator does, so the pool stops at 0, the table is told, and they stay on
- * their feet. A ward is one use: the item is spent when it is played and it
+ * A pool stops at 0. An investigator at 0 Health has fallen and at 0 Sanity
+ * has gone mad; either way they are out, and settleCasualties deals with it
+ * once the action that did it is over. A ward is one use: the item is spent when it is played and it
  * takes the whole of the next source, because one card is one source.
  */
 function changePool(state, player, pool, amount, source) {
@@ -1823,11 +2026,10 @@ function changePool(state, player, pool, amount, source) {
         ? `${player.name} has no ${word} left to lose (0 of ${max}).`
         : `${player.name} loses ${lost} ${word} (${source}) — ${player[pool]} of ${max} left.`,
     );
-    if (before > 0 && player[pool] === 0) {
-      pushLog(
-        state,
-        `${player.name} is at 0 ${word}. Nothing in the base game knocks anyone out — the pools colour the mood and nothing more — so they play on.`,
-      );
+    if (before > 0 && player[pool] === 0 && !player.down) {
+      // Settled once the action that caused it has finished — see settleCasualties.
+      player.down = pool === 'sanity' ? 'mad' : 'fallen';
+      player.downDuring = `${state.round}:${state.turnIndex}`;
     }
     return;
   }
@@ -1877,6 +2079,13 @@ function doChoose(state, action, ctx) {
 function resolveChoice(state, ctx, choice, picked) {
   const chooser = state.players.find((player) => player.id === choice.playerId);
   if (!chooser) throw new Error('the choice names an investigator who is not at the table');
+
+  if (choice.kind === 'new-investigator') {
+    const sheet = ctx.investigators?.[picked.id];
+    if (!sheet) throw new Error(`there is no investigator "${picked.id}"`);
+    seatInvestigator(state, ctx, chooser, sheet);
+    return;
+  }
 
   // A card in hand is the only choice whose answer is not an investigator.
   if (choice.kind === 'discard-item') {
@@ -1986,7 +2195,7 @@ function applyItemFields(state, ctx, item, player, effect) {
   if (effect.sanity) changePool(state, player, 'sanity', effect.sanity, `the ${item.name}`);
 
   if (effect.giveClue || effect.pull) {
-    const others = state.players.filter((someone) => someone.id !== player.id);
+    const others = onTable(state).filter((someone) => someone.id !== player.id);
     if (others.length === 0) {
       pushLog(state, `The ${item.name} has nobody else to reach for.`);
     } else if (effect.giveClue) {
@@ -2176,8 +2385,10 @@ function doEndTurn(state, ctx) {
   // mansion does not: looking into a card costs one of the turn's two actions.
   revealAtEndOfTurn(state, ctx, player);
 
-  if (state.turnIndex + 1 < state.players.length) {
-    state.turnIndex += 1;
+  let nextSeat = state.turnIndex + 1;
+  while (nextSeat < state.players.length && state.players[nextSeat].out) nextSeat += 1;
+  if (nextSeat < state.players.length) {
+    state.turnIndex = nextSeat;
     state.actionsLeft = state.actionsPerTurn;
     return state;
   }
@@ -2188,10 +2399,11 @@ function doEndTurn(state, ctx) {
   // Cards timed to the end of a round go over before the house moves, so the
   // table sees them before the corridors turn.
   flipAtRoundEnd(state, ctx, endingRound);
-  const roller = state.players[(endingRound - 1) % state.players.length];
+  const seated = onTable(state);
+  const roller = seated[(endingRound - 1) % seated.length];
   state.lastShift = resolveShift(state, endingRound, roller, ctx);
   state.round = endingRound + 1;
-  state.turnIndex = 0;
+  state.turnIndex = state.players.findIndex((p) => !p.out);
   state.actionsLeft = state.actionsPerTurn;
   return state;
 }
@@ -2325,7 +2537,7 @@ function chooseSquare(state, placement, slot, entry, taken, index) {
   } else {
     // nearest and farthest are measured from the square the investigator came in
     // on. They are standing on it, so it is never a candidate for either.
-    const stood = new Set(state.players.map((p) => posKey(p.pos)));
+    const stood = new Set(onTable(state).map((p) => posKey(p.pos)));
     pool = free.filter((n) => !stood.has(posKey(posOfNumber(slot, n))));
     if (pool.length === 0) return null;
     const away = (n) => {
@@ -2563,7 +2775,7 @@ function collectEncounter(state, ctx, key) {
 }
 
 function playersInRoom(state, slot) {
-  return state.players.filter((p) => {
+  return onTable(state).filter((p) => {
     const at = slotOf(p.pos);
     return at.R === slot.R && at.C === slot.C;
   });

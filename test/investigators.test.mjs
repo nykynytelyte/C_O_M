@@ -9,6 +9,7 @@ import { readFile } from 'node:fs/promises';
 import assert from 'node:assert/strict';
 
 import {
+  buildScenario,
   createGame,
   reduce,
   currentPlayer,
@@ -24,7 +25,11 @@ import {
 
 const here = (relative) => new URL(relative, import.meta.url);
 
-const scenario = JSON.parse(await readFile(here('../scenarios/mansion/scenario.json'), 'utf8'));
+const core = JSON.parse(await readFile(here('../rules/core.json'), 'utf8'));
+const scenario = buildScenario(
+  core,
+  JSON.parse(await readFile(here('../scenarios/mansion/scenario.json'), 'utf8')),
+);
 const rooms = roomsFromCsv(await readFile(here('../decks/rooms.csv'), 'utf8'));
 const entrances = entrancesFromCsv(await readFile(here('../decks/entrance.csv'), 'utf8'));
 const encounterCards = encountersFromCsv(await readFile(here('../decks/encounters.csv'), 'utf8'));
@@ -253,17 +258,74 @@ const ctx = { scenario, rooms, entrances, encounterCards, items, events, investi
   assert.equal(full.players[0].sanity, 6, 'a full investigator stays full');
   assert.match(full.log.join('\n'), /already at full Sanity/);
 
-  // Zero is a floor, not a defeat: the rulebook has not said what happens at 0,
-  // so the table is told and the investigator stays standing.
+  // At 0 Sanity the investigator goes mad: the house keeps them as a monster
+  // where they stood, and the player takes up a sheet nobody has played yet.
   const emptied = read(['11'], (game) => {
     game.players[0].sanity = 1;
   });
   assert.equal(emptied.players[0].sanity, 0, 'a two-point loss stops at zero');
-  assert.match(
-    emptied.log.join('\n'),
-    /is at 0 Sanity\. Nothing in the base game knocks anyone out/,
-    'zero is a floor, not a knockout',
+  assert.match(emptied.log.join('\n'), /has gone mad\. Where they stood, there is now a monster/);
+  assert.equal(emptied.monsters.length, 1, 'madness leaves a monster behind');
+  assert.deepEqual(emptied.monsters[0].pos, emptied.players[0].pos, 'standing where they went mad');
+  assert.equal(emptied.choice?.kind, 'new-investigator', 'the seat is offered a new sheet');
+  const offered = emptied.choice.options.map((o) => o.id);
+  for (const seated of emptied.usedInvestigators) {
+    assert.ok(!offered.includes(seated), `investigator ${seated} has already been played`);
+  }
+  assert.throws(
+    () => reduce(emptied, { type: 'END_TURN' }, ctx),
+    /answer the choice/,
+    'nothing happens until the seat is filled',
   );
+
+  const replaced = reduce(emptied, { type: 'CHOOSE', optionId: offered[0] }, ctx);
+  const fresh = replaced.players[0];
+  const sheet = investigators[offered[0]];
+  assert.equal(fresh.investigatorId, sheet.id);
+  assert.equal(fresh.name, sheet.name);
+  assert.equal(fresh.sanity, sheet.sanity, 'a new investigator starts with a full sheet');
+  assert.equal(fresh.health, sheet.health);
+  assert.equal(fresh.clues, 0);
+  assert.deepEqual(fresh.items, []);
+  assert.deepEqual(fresh.pos, { gr: 1, gc: 1 }, 'and starts in the Foyer');
+  assert.equal(fresh.down, undefined);
+  assert.ok(replaced.usedInvestigators.includes(sheet.id), 'and is not dealt again');
+  assert.equal(replaced.turnIndex, 1, 'going mad on your own turn ends it');
+  assert.equal(replaced.choice, null);
+
+  // At 0 Health the investigator has fallen: no monster, a new sheet all the same.
+  const fallen = read(['19'], (game) => {
+    game.players[0].health = 1;
+  });
+  assert.equal(fallen.players[0].health, 0);
+  assert.match(fallen.log.join('\n'), /has fallen/);
+  assert.equal(fallen.monsters.length, 0, 'a fallen investigator is not a monster');
+  assert.equal(fallen.choice?.kind, 'new-investigator');
+
+  // With every sheet already played there is no one to send, and the seat is out.
+  const lastStand = read(['19'], (game) => {
+    game.players[0].health = 1;
+    game.usedInvestigators = Object.keys(investigators);
+  });
+  assert.equal(lastStand.players[0].out, true, 'no sheets left: the seat is out');
+  assert.equal(lastStand.choice, null);
+  assert.equal(lastStand.turnIndex, 1, 'and play passes on');
+  assert.equal(lastStand.over, null, 'one seat is still in the game');
+  let rounds = lastStand;
+  for (let i = 0; i < 3; i++) {
+    rounds = reduce(rounds, { type: 'END_TURN' }, ctx);
+    assert.equal(rounds.turnIndex, 1, 'a seat that is out is skipped');
+  }
+
+  // When the last seat is out, the game is over.
+  const wiped = read(['19'], (game) => {
+    game.players[0].health = 1;
+    game.players[1].out = true;
+    game.usedInvestigators = Object.keys(investigators);
+  });
+  assert.deepEqual(wiped.over, { result: 'lost', reason: 'Every investigator is gone.' });
+  assert.throws(() => reduce(wiped, { type: 'END_TURN' }, ctx), /the game is over/);
+
   const again = read(['11'], (game) => {
     game.players[0].sanity = 0;
   });
