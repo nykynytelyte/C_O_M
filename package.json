@@ -5,6 +5,7 @@
   "type": "module",
   "description": "Digital table for Corridors of Madness.",
   "scripts": {
-    "test": "node test/engine.test.mjs && node test/investigators.test.mjs"
+    "test": "node test/engine.test.mjs && node test/investigators.test.mjs && node test/scenario.test.mjs",
+    "sim": "node sim/run.mjs"
   }
 }

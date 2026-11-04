@@ -12,6 +12,7 @@
  */
 
 import {
+  buildScenario,
   createGame,
   reduce,
   legalDestinations,
@@ -24,6 +25,17 @@ import {
   eventsFromCsv,
   itemsFromCsv,
   investigatorsFromCsv,
+  monstersFromCsv,
+  monsterCount,
+  sealProblem,
+  sealTarget,
+  combatProblem,
+  engagedWith,
+  roomSpecialHere,
+  roomSpecialProblem,
+  activeTrait,
+  traitProblem,
+  forceWallProblem,
   useItemProblem,
   doorsAt,
   roomKey,
@@ -31,6 +43,8 @@ import {
   OPPOSITE,
   ROOM_SIZE,
 } from './engine.js';
+
+const SCENARIO_DIR = './scenarios/nameless-presence';
 
 const DIRS = [
   { key: 'n', dr: -1, dc: 0 },
@@ -65,15 +79,23 @@ async function boot() {
     'newgame',
     'copy',
     'diag',
+    'story',
+    'seal',
+    'attack',
+    'flee',
+    'roomuse',
+    'trait',
+    'forcewall',
     'flash',
   ]) {
     el[id] = document.getElementById(id);
   }
 
   try {
-    const [scenario, roomsText, entranceText, encounterText, itemText, eventText, sheetText] =
+    const [core, scenarioData, roomsText, entranceText, encounterText, itemText, eventText, sheetText] =
       await Promise.all([
-        fetchJson('./scenarios/mansion/scenario.json'),
+        fetchJson('./rules/core.json'),
+        fetchJson(`${SCENARIO_DIR}/scenario.json`),
         fetchText('./decks/rooms.csv'),
         fetchText('./decks/entrance.csv'),
         fetchText('./decks/encounters.csv'),
@@ -81,8 +103,12 @@ async function boot() {
         fetchText('./decks/events.csv'),
         fetchText('./decks/investigators.csv'),
       ]);
+    const monsterText = scenarioData.monsterDeck
+      ? await fetchText(`${SCENARIO_DIR}/${scenarioData.monsterDeck}`)
+      : null;
     ctx = {
-      scenario,
+      scenario: buildScenario(core, scenarioData),
+      monsterCards: monsterText ? monstersFromCsv(monsterText) : null,
       rooms: roomsFromCsv(roomsText),
       entrances: entrancesFromCsv(entranceText),
       encounterCards: encountersFromCsv(encounterText),
@@ -94,6 +120,10 @@ async function boot() {
     el.status.textContent = `Could not load the scenario: ${err.message}`;
     return;
   }
+
+  el.story.textContent = ctx.scenario.story?.epigraph
+    ? `“${ctx.scenario.story.epigraph}”  ${ctx.scenario.story.intro ?? ''}`
+    : (ctx.scenario.story?.intro ?? '');
 
   el.players.innerHTML = '';
   for (let n = ctx.scenario.players.min; n <= ctx.scenario.players.max; n++) {
@@ -109,6 +139,13 @@ async function boot() {
   el.board.addEventListener('click', onBoardClick);
   el.investigate.addEventListener('click', () => dispatch({ type: 'INVESTIGATE' }));
   el.endturn.addEventListener('click', () => dispatch({ type: 'END_TURN' }));
+  el.seal.addEventListener('click', () => dispatch({ type: 'SEAL' }));
+  el.attack.addEventListener('click', () => dispatch({ type: 'ATTACK' }));
+  el.flee.addEventListener('click', () => dispatch({ type: 'FLEE' }));
+  el.roomuse.addEventListener('click', () => dispatch({ type: 'ROOM_SPECIAL' }));
+  el.trait.addEventListener('click', () => dispatch({ type: 'USE_TRAIT' }));
+  el.forcewall.addEventListener('click', () => dispatch({ type: 'FORCE_WALL' }));
+  el.seal.hidden = !ctx.scenario.seal;
   el.newgame.addEventListener('click', () => newGame(true));
   el.copy.addEventListener('click', copyReplay);
 
@@ -272,12 +309,82 @@ function renderStatus() {
   const markers = Object.values(state.encounters ?? {});
   const faceDown = markers.filter((marker) => !marker.faceUp).length;
 
+  if (state.over) {
+    el.status.innerHTML =
+      `<span class="stat"><b>Round</b> ${state.round}</span>` +
+      `<span class="stat ${state.over.result === 'won' ? 'won' : 'over'}"><b>${
+        state.over.result === 'won' ? 'Victory' : 'Defeat'
+      }</b> ${state.over.reason}</span>`;
+    el.endturn.disabled = true;
+    el.investigate.disabled = true;
+    el.seal.disabled = true;
+    el.attack.disabled = true;
+    el.flee.disabled = true;
+    el.roomuse.hidden = true;
+    el.trait.hidden = true;
+    el.forcewall.hidden = true;
+    return;
+  }
+
+  for (const kind of ['attack', 'flee']) {
+    const problem = combatProblem(state, kind);
+    el[kind].disabled = Boolean(problem);
+    el[kind].title =
+      problem ??
+      (kind === 'attack'
+        ? 'Attack a monster on or next to your square. Roll 1d6: 4-6 hits, 1-3 misses and you take 1 damage. Costs one action.'
+        : 'Break away from a monster you are engaged with. Roll 1d6: 4+ escapes, 1-3 fails and you take 1 damage. Costs one action.');
+  }
+  const special = roomSpecialHere(state, ctx);
+  el.roomuse.hidden = !special;
+  if (special) {
+    const problem = roomSpecialProblem(state, ctx);
+    el.roomuse.textContent = `${special.room.name}: ${special.label}`;
+    el.roomuse.disabled = Boolean(problem);
+    el.roomuse.title = problem ?? `${special.label}. Costs one action.`;
+  }
+  const trait = activeTrait(state, ctx);
+  el.trait.hidden = !trait;
+  if (trait) {
+    const problem = traitProblem(state, ctx);
+    el.trait.textContent = `${trait.name}: ${trait.label}`;
+    el.trait.disabled = Boolean(problem);
+    el.trait.title = problem ?? `${trait.label}. Costs one action.`;
+  }
+  const rule = ctx.scenario.escape;
+  el.forcewall.hidden = !rule || state.round < (rule.fromRound ?? 1);
+  if (!el.forcewall.hidden) {
+    const problem = forceWallProblem(state, ctx);
+    el.forcewall.disabled = Boolean(problem);
+    el.forcewall.title =
+      problem ?? 'Push through a wall into the room on the other side. Costs one action.';
+  }
+  const holding = engagedWith(state, currentPlayer(state));
+
+  const boss = (state.monsters ?? []).find((m) => m.kind === 'boss');
+  const summon = ctx.scenario.summon;
+  const scenarioStats =
+    (summon
+      ? `<span class="stat"><b>Monsters</b> ${monsterCount(state)} of ${summon.monstersAtLeast}</span>`
+      : '') +
+    (boss ? `<span class="stat over"><b>${boss.name}</b> ${boss.health} of ${boss.healthMax} Health</span>` : '') +
+    (ctx.scenario.seal && !boss
+      ? `<span class="stat"><b>Seal</b> ${state.sealClues ?? 0} of ${sealTarget(state, ctx)} clues</span>`
+      : '');
+  const seal = sealProblem(state, ctx);
+  el.seal.disabled = Boolean(seal);
+  el.seal.title = seal ?? 'Spend your clues on the seal in the Rift Room. Costs one action.';
+
   el.status.innerHTML =
     `<span class="stat"><b>Round</b> ${state.round}</span>` +
     `<span class="stat"><b>Turn</b> ${player.name}</span>` +
     `<span class="stat"><b>Room</b> ${where}</span>` +
     `<span class="stat"><b>Actions</b> ${state.actionsLeft} of ${state.actionsPerTurn}</span>` +
     `<span class="stat"><b>Steps</b> ${steps}</span>` +
+    (holding.length
+      ? `<span class="stat over"><b>Engaged</b> ${holding.map((m) => m.name).join(', ')}</span>`
+      : '') +
+    scenarioStats +
     `<span class="stat"><b>Clues</b> ${player.clues ?? 0}${
       player.clueLimit ? ` of ${player.clueLimit}` : ''
     }</span>` +
@@ -430,7 +537,20 @@ function buildSpaces(R, C, isRoom) {
       }
 
       if (isRoom) {
+        for (const monster of state.monsters ?? []) {
+          if (monster.pos.gr !== gr || monster.pos.gc !== gc) continue;
+          const token = document.createElement('span');
+          token.className = monster.kind === 'boss' ? 'token monster boss' : 'token monster';
+          token.textContent =
+            monster.kind === 'boss' ? '☉' : monster.kind === 'mad' ? '?' : monster.name.replace(/^The /, '')[0];
+          const card = monster.cardId ? ctx.monsterCards?.[monster.cardId] : null;
+          token.title =
+            `${monster.name} — ${monster.health} of ${monster.healthMax} Health` +
+            (card?.ability ? `\n${card.ability}: ${card.text}` : '');
+          space.appendChild(token);
+        }
         state.players.forEach((player, index) => {
+          if (player.out) return;
           if (player.pos.gr !== gr || player.pos.gc !== gc) return;
           const token = document.createElement('span');
           token.className = `token p${(index % 4) + 1}`;
@@ -519,7 +639,8 @@ function renderChoice() {
   el.pending.innerHTML = '';
 
   const heading = document.createElement('h2');
-  heading.textContent = 'A choice to make';
+  heading.textContent =
+    choice.kind === 'new-investigator' ? 'A new investigator' : 'A choice to make';
   heading.setAttribute('tabindex', '-1');
   el.pending.appendChild(heading);
 
@@ -566,10 +687,11 @@ function renderParty() {
   for (const [index, player] of state.players.entries()) {
     const sheet = ctx.investigators?.[player.investigatorId];
     const block = document.createElement('div');
-    block.className = index === state.turnIndex ? 'investigator turn' : 'investigator';
+    block.className =
+      player.out ? 'investigator out' : index === state.turnIndex ? 'investigator turn' : 'investigator';
 
     const name = document.createElement('h3');
-    name.textContent = player.name;
+    name.textContent = player.out ? `${player.name} — out of the game` : player.name;
     block.appendChild(name);
 
     if (sheet?.role) {
@@ -601,7 +723,7 @@ function renderParty() {
       trait.className = 'trait';
       trait.textContent = sheet.traitNeeds
         ? `${sheet.trait} — pending: ${sheet.traitNeeds}`
-        : sheet.trait;
+        : `${sheet.trait}: ${sheet.traitText}`;
       trait.title = sheet.traitText;
       block.appendChild(trait);
     }

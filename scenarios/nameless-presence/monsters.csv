@@ -1,0 +1,13 @@
+id,name,health,ability,power,text,flavor
+1,Shuddering Husk,2,Split Instinct,spawn-adjacent-room@5-6,"When revealed, roll 1d6. On 5-6, spawn another monster in an adjacent room.","Its mouth still moves, but no breath escapes"
+2,Shuddering Husk,2,Split Instinct,spawn-adjacent-room@5-6,"When revealed, roll 1d6. On 5-6, spawn another monster in an adjacent room.","Its mouth still moves, but no breath escapes"
+3,Shuddering Husk,2,Split Instinct,spawn-adjacent-room@5-6,"When revealed, roll 1d6. On 5-6, spawn another monster in an adjacent room.","Its mouth still moves, but no breath escapes"
+4,Mourner,1,Wail of Stillness,blocks-investigate-room,"Players cannot Investigate while in the same room as the Mourner.","It weeps for the moment just before you arrived"
+5,Mourner,1,Wail of Stillness,blocks-investigate-room,"Players cannot Investigate while in the same room as the Mourner.","It weeps for the moment just before you arrived"
+6,Mourner,1,Wail of Stillness,blocks-investigate-room,"Players cannot Investigate while in the same room as the Mourner.","It weeps for the moment just before you arrived"
+7,Mourner,1,Wail of Stillness,blocks-investigate-room,"Players cannot Investigate while in the same room as the Mourner.","It weeps for the moment just before you arrived"
+8,Mad Reflection,3,Mind Mirror,damage-to-sanity,"When this monster deals damage, the player loses Sanity instead of Health.","You strike at it. You feel the pain"
+9,Mad Reflection,3,Mind Mirror,damage-to-sanity,"When this monster deals damage, the player loses Sanity instead of Health.","You strike at it. You feel the pain"
+10,Mad Reflection,3,Mind Mirror,damage-to-sanity,"When this monster deals damage, the player loses Sanity instead of Health.","You strike at it. You feel the pain"
+11,The Whisperer,3,Suggestion of Ruin,all-players-sanity@1-2,"When revealed, all players roll 1d6. On a 1-2, they lose 1 Sanity.","You didn't hear it. You understood it"
+12,The Whisperer,3,Suggestion of Ruin,all-players-sanity@1-2,"When revealed, all players roll 1d6. On a 1-2, they lose 1 Sanity.","You didn't hear it. You understood it"

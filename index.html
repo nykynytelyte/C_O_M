@@ -270,6 +270,13 @@
       .token.p2 { background: var(--blue); }
       .token.p3 { background: #9d8fd0; }
       .token.p4 { background: #8fbf9a; }
+      .token.monster { background: #b8473f; color: #f4e9e7; border-radius: 3px; }
+      .token.monster.boss { background: #1a0d0d; color: #e07a70; box-shadow: 0 0 0 2px #e07a70; width: 22px; height: 22px; font-size: 14px; }
+      .stat.won { color: #8fbf9a; }
+      .investigator.out { opacity: 0.45; }
+      .stat.over { color: #e07a70; }
+      #story { font-style: italic; opacity: 0.85; }
+      #story:empty { display: none; }
 
       /* Side column ------------------------------------------------ */
 
@@ -546,17 +553,27 @@
         investigating is what takes it up. A Clue gives its token and a Nothing gives nothing;
         a Monster, an Event or an Item brings a card out of its own deck — an Item is laid face up
         beside it and named, then goes into the hand when it is taken up, at no cost in actions. Seeing a card is not having it: one revealed
-        across the room still has to be walked to and investigated. Every entry turns a card, including walking back into a
-        room you have already opened. Every deck is shuffled back in when it runs out, apart from the
+        across the room still has to be walked to and investigated. Entering a room turns an entrance card, even one you have already opened, but only once per investigator per turn.
+        Every deck is shuffled back in when it runs out, apart from the
         rooms themselves — there are only so many of those. Health and Sanity come off the
-        investigator sheets: Events and Items take and give both, a ward takes the whole of the next
-        loss, and nothing goes below zero. A few cards are still pending: they wait on monsters, a
+        investigator sheets: Events and Items take and give both, and a ward takes the whole of the next
+        loss. At 0 Health an investigator has fallen; at 0 Sanity they go mad and become a monster
+        where they stood. Either way they are out, and the player picks a new investigator, who
+        starts in the Foyer. Monsters come from the scenario's own deck: a Monster card turned over brings one onto its
+        square, and the Wrench, Revolver, Knife and Holy Water can strike them. Attack a monster on or next to you (4-6 hits, 1-3 misses and hurts you); end your turn
+        beside one, or be beside one when it appears, and you are engaged — then you may only Attack
+        or Flee (4+ escapes, 1-3 hurts you). Fail an Attack or Flee roll with a Clue in hand and you may spend it to roll again; the boss hits
+        for 2. Monsters block movement, and at the end of each round every monster moves 1 space toward
+        the nearest investigator, through doors. From round 10 the house can no longer hold anyone in: as an action, step
+        through a wall into the room on the other side. A few cards are still
+        pending: they wait on a
         choice, another investigator, a die, a lock or the encounter deck put back in order, and they
         say so when they turn up instead of pretending to work.
       </p>
     </header>
 
     <main class="wrap">
+      <p id="story"></p>
       <div id="status"></div>
 
       <div id="board" aria-label="Mansion floor"></div>
@@ -581,6 +598,12 @@
           <h2>Actions</h2>
           <div class="controls">
             <button class="btn" id="investigate">Investigate</button>
+            <button class="btn" id="attack">Attack</button>
+            <button class="btn" id="flee">Flee</button>
+            <button class="btn" id="roomuse" hidden>Use room</button>
+            <button class="btn" id="trait" hidden>Use trait</button>
+            <button class="btn" id="forcewall" hidden>Force a wall</button>
+            <button class="btn" id="seal">Seal the Rift</button>
             <button class="btn primary" id="endturn">End turn</button>
           </div>
         </section>
