@@ -1,0 +1,2782 @@
+/**
+ * Corridors of Madness — rules engine.
+ *
+ * The engine knows nothing about any particular scenario. Everything it needs
+ * arrives as `ctx = { scenario, rooms }`, so adding a scenario is adding data,
+ * not editing this file.
+ *
+ * Two properties are load-bearing and should survive every rule change:
+ *
+ *  1. `reduce` is pure. It clones the state, applies one action, returns the
+ *     new state. No hidden mutation, no globals.
+ *  2. Randomness is a seeded xorshift whose position lives in `state.rngState`.
+ *     So `{ seed, actions }` reproduces any game exactly. When a player reports
+ *     a bug you replay their game instead of asking what they think happened.
+ *
+ * State is plain JSON: no class instances, no functions, no Dates.
+ *
+ * ---------------------------------------------------------------------------
+ * Geometry
+ * ---------------------------------------------------------------------------
+ *
+ * Every room card is a 3x3 grid of spaces. The mansion is a growing grid of
+ * room slots, and each slot owns the 3x3 block of spaces at
+ *
+ *     gr = slotR * 3 + r      gc = slotC * 3 + c
+ *
+ * So a position is one pair of integers, movement is one orthogonal step, and
+ * crossing between rooms is just the step that happens to cross a multiple-of-3
+ * line. That keeps walking inside a room and walking through a door the same
+ * operation, which is why the whole thing stays simple.
+ *
+ * A door is always in the middle square of its side, never in a corner. That is
+ * why a door always meets a door: two middles line up by definition. What the
+ * house does instead is turn. A quarter turn carries a door onto another side,
+ * and if that side has no door, the doorway becomes a wall — which is how an
+ * investigator ends up sealed in.
+ */
+
+/* ------------------------------------------------------------------ *
+ * Constants
+ * ------------------------------------------------------------------ */
+
+export const ROOM_SIZE = 3;
+
+const DIRS = [
+  { key: 'n', dr: -1, dc: 0 },
+  { key: 'e', dr: 0, dc: 1 },
+  { key: 's', dr: 1, dc: 0 },
+  { key: 'w', dr: 0, dc: -1 },
+];
+
+const DIR_KEYS = ['n', 'e', 's', 'w'];
+
+const DIR_WORD = { n: 'north', e: 'east', s: 'south', w: 'west' };
+
+/** The middle square of a side. The only place a door is ever cut. */
+const DOOR_AT = 1;
+
+export const OPPOSITE = { n: 's', e: 'w', s: 'n', w: 'e' };
+
+const mod = (n, m) => ((n % m) + m) % m;
+
+/* ------------------------------------------------------------------ *
+ * Positions
+ *
+ * A position is { gr, gc } in global space. `slotOf` says which room it is
+ * in, `localOf` says where in that room's own 3x3 grid.
+ * ------------------------------------------------------------------ */
+
+export function roomKey(slotR, slotC) {
+  return `${slotR},${slotC}`;
+}
+
+export function slotOf(pos) {
+  return { R: Math.floor(pos.gr / ROOM_SIZE), C: Math.floor(pos.gc / ROOM_SIZE) };
+}
+
+export function localOf(pos) {
+  return { r: mod(pos.gr, ROOM_SIZE), c: mod(pos.gc, ROOM_SIZE) };
+}
+
+function posOf(slotR, slotC, r, c) {
+  return { gr: slotR * ROOM_SIZE + r, gc: slotC * ROOM_SIZE + c };
+}
+
+/** Which direction is one orthogonal step from `from` to `to`? null if not adjacent. */
+function travelDir(from, to) {
+  const dr = to.gr - from.gr;
+  const dc = to.gc - from.gc;
+  if (Math.abs(dr) + Math.abs(dc) !== 1) return null;
+  if (dr === -1) return 'n';
+  if (dr === 1) return 's';
+  return dc === 1 ? 'e' : 'w';
+}
+
+/**
+ * Which square along the edge a step leaving `from` in direction `dir` passes
+ * through. North and south measure across the columns, east and west down the
+ * rows. Since a door only exists at the middle, this says whether a square is a
+ * doorway or the stretch of wall beside it.
+ */
+function edgeOffset(from, dir) {
+  const local = localOf(from);
+  return dir === 'n' || dir === 's' ? local.c : local.r;
+}
+
+/* ------------------------------------------------------------------ *
+ * Scenario data loading
+ * ------------------------------------------------------------------ */
+
+/** Minimal RFC4180-ish CSV reader. Handles quoted fields and doubled quotes. */
+export function parseCsv(text) {
+  const rows = [];
+  let row = [];
+  let field = '';
+  let quoted = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (quoted) {
+      if (ch === '"') {
+        if (text[i + 1] === '"') {
+          field += '"';
+          i++;
+        } else {
+          quoted = false;
+        }
+      } else {
+        field += ch;
+      }
+      continue;
+    }
+    if (ch === '"') quoted = true;
+    else if (ch === ',') {
+      row.push(field);
+      field = '';
+    } else if (ch === '\n') {
+      row.push(field);
+      rows.push(row);
+      row = [];
+      field = '';
+    } else if (ch !== '\r') {
+      field += ch;
+    }
+  }
+  if (field !== '' || row.length > 0) {
+    row.push(field);
+    rows.push(row);
+  }
+  return rows.filter((r) => r.some((f) => f.trim() !== ''));
+}
+
+/**
+ * Read one side's door: 1 for a door, 0 for wall. A door only ever sits in the
+ * middle of a side, so there is nothing else to describe. 010 and 000 are taken
+ * as the same thing, for anyone filling in the three squares by hand.
+ */
+function parseEdgeDoors(value, id, dir) {
+  const text = (value ?? '').trim();
+  if (text === '' || text === '0' || text === '000') return [false, false, false];
+  if (text === '1' || text === '010') return [false, true, false];
+  throw new Error(
+    `room "${id}" has "${text}" for its ${dir} side; expected 1 for a door or 0 for a wall`,
+  );
+}
+
+/**
+ * Turn the rooms CSV into a map of id -> room card.
+ * Expected columns: id, name, n, e, s, w, text.
+ */
+export function roomsFromCsv(text) {
+  const [header, ...rows] = parseCsv(text);
+  if (!header) throw new Error('rooms CSV is empty');
+
+  const column = (name) => {
+    const index = header.indexOf(name);
+    if (index === -1) throw new Error(`rooms CSV is missing the "${name}" column`);
+    return index;
+  };
+
+  const iId = column('id');
+  const iName = column('name');
+  const iText = column('text');
+  const iDoors = Object.fromEntries(DIR_KEYS.map((dir) => [dir, column(dir)]));
+
+  const rooms = {};
+  const seenNames = new Map();
+
+  for (const row of rows) {
+    const id = (row[iId] ?? '').trim();
+    if (!id) continue;
+    if (rooms[id]) throw new Error(`rooms CSV has a duplicate id: "${id}"`);
+
+    const doors = {};
+    for (const dir of DIR_KEYS) doors[dir] = parseEdgeDoors(row[iDoors[dir]], id, dir);
+
+    const openings = DIR_KEYS.reduce((n, dir) => n + doors[dir].filter(Boolean).length, 0);
+    if (openings === 0) {
+      throw new Error(`room "${id}" has no doors at all, so it could never be entered`);
+    }
+
+    const name = (row[iName] ?? id).trim();
+    if (seenNames.has(name)) {
+      throw new Error(`rooms CSV has two rooms called "${name}"`);
+    }
+    seenNames.set(name, id);
+
+    rooms[id] = {
+      id,
+      name,
+      doors,
+      openings,
+      text: (row[iText] ?? '').trim(),
+    };
+  }
+
+  if (Object.keys(rooms).length === 0) throw new Error('rooms CSV has no rooms');
+  return rooms;
+}
+
+/* ------------------------------------------------------------------ *
+ * Room entrance cards
+ *
+ * Walking into a room is not the end of the move: the room's entrance card says
+ * where the encounter cards lie. Every card in that deck is one of a handful of
+ * sentences — draw N, put them on these squares, this way up — so the deck is
+ * data, and a second deck is a second CSV.
+ *
+ * Squares are numbered the way they are printed on the card, reading left to
+ * right and top to bottom as the card lies on the table once it has been turned:
+ *
+ *     1 2 3
+ *     4 5 6
+ *     7 8 9
+ *
+ * The numbering belongs to the table, not to the card, which is why the corners
+ * of a room turned sideways are still its corners.
+ * ------------------------------------------------------------------ */
+
+const SPACE_NUMBERS = ROOM_SIZE * ROOM_SIZE;
+const REVEAL_MODES = ['none', 'on', 'adjacent', 'on-or-adjacent'];
+
+// An encounter card does not say what happens; it says which of the house's
+// decks you are sent to. Five kinds, so the deck is built from five lists.
+const ENCOUNTER_TYPES = ['monster', 'clue', 'nothing', 'event', 'item'];
+const ENCOUNTER_WORD = {
+  monster: 'Monster',
+  clue: 'Clue',
+  nothing: 'Nothing',
+  event: 'Event',
+  item: 'Item',
+};
+
+/**
+ * How far a turn has to reach to turn an encounter card over.
+ *
+ * Off by default: investigating a card is an action, so a card that turns over
+ * for free just by ending a turn beside it is a rule a scenario has to ask for.
+ */
+function revealMode(scenario) {
+  const mode = scenario.encounters?.revealOnEndTurn ?? 'none';
+  if (!REVEAL_MODES.includes(mode)) {
+    throw new Error(
+      `scenario reveals encounter cards "${mode}", which is not one of ${REVEAL_MODES.join(', ')}`,
+    );
+  }
+  return mode;
+}
+const CORNER_SPACES = [1, 3, 7, 9];
+const EDGE_SPACES = [2, 4, 6, 8];
+const FLIP_RULES = ['end-of-next-round', 'second-player', 'end-turn-adjacent'];
+
+function parsePlacement(value, id) {
+  const text = (value ?? '').trim();
+  if (text === 'none') return { kind: 'none' };
+  if (['random', 'corners', 'edges', 'nearest', 'farthest'].includes(text)) {
+    return { kind: text };
+  }
+
+  const match = /^spaces?:([0-9]+(?:\+[0-9]+)*)$/.exec(text);
+  if (!match) {
+    throw new Error(
+      `entrance card "${id}" has "${text}" for its placement, which is not something the table can do`,
+    );
+  }
+  const spaces = match[1].split('+').map(Number);
+  for (const n of spaces) {
+    if (!Number.isInteger(n) || n < 1 || n > SPACE_NUMBERS) {
+      throw new Error(
+        `entrance card "${id}" places a card on square ${n}; the squares are 1-${SPACE_NUMBERS}`,
+      );
+    }
+  }
+  if (new Set(spaces).size !== spaces.length) {
+    throw new Error(`entrance card "${id}" puts two cards on the same square`);
+  }
+  return { kind: 'fixed', spaces };
+}
+
+function parseSpecials(value, id) {
+  const out = {
+    discardOne: false,
+    playerChoice: false,
+    shiftPoints: 0,
+    ifMonsterSpace: null,
+    flip: null,
+  };
+
+  for (const token of (value ?? '').split('|').map((t) => t.trim()).filter(Boolean)) {
+    if (token === 'discard-one') {
+      out.discardOne = true;
+    } else if (token === 'player-choice') {
+      out.playerChoice = true;
+    } else if (token.startsWith('shift-point:')) {
+      const n = Number(token.slice('shift-point:'.length));
+      if (!Number.isInteger(n) || n <= 0) {
+        throw new Error(`entrance card "${id}" marks "${token}", which is not a number of points`);
+      }
+      out.shiftPoints += n;
+    } else if (token.startsWith('if-monster:')) {
+      const n = Number(token.slice('if-monster:'.length));
+      if (!Number.isInteger(n) || n < 1 || n > SPACE_NUMBERS) {
+        throw new Error(
+          `entrance card "${id}" has "${token}"; the extra card needs a square 1-${SPACE_NUMBERS}`,
+        );
+      }
+      out.ifMonsterSpace = n;
+    } else if (token.startsWith('flip:')) {
+      const rule = token.slice('flip:'.length);
+      if (!FLIP_RULES.includes(rule)) {
+        throw new Error(
+          `entrance card "${id}" flips on "${rule}", which is not one of ${FLIP_RULES.join(', ')}`,
+        );
+      }
+      out.flip = rule;
+    } else {
+      throw new Error(`entrance card "${id}" has an unknown instruction "${token}"`);
+    }
+  }
+  return out;
+}
+
+/**
+ * Turn the entrance CSV into a map of id -> card.
+ * Expected columns: id, draw, face, placement, special, text.
+ */
+export function entrancesFromCsv(text) {
+  const [header, ...rows] = parseCsv(text);
+  if (!header) throw new Error('entrance CSV is empty');
+
+  const column = (name) => {
+    const index = header.indexOf(name);
+    if (index === -1) throw new Error(`entrance CSV is missing the "${name}" column`);
+    return index;
+  };
+
+  const iId = column('id');
+  const iDraw = column('draw');
+  const iFace = column('face');
+  const iPlace = column('placement');
+  const iSpecial = column('special');
+  const iText = column('text');
+
+  const cards = {};
+
+  for (const row of rows) {
+    const id = (row[iId] ?? '').trim();
+    if (!id) continue;
+    if (cards[id]) throw new Error(`entrance CSV has a duplicate id: "${id}"`);
+
+    const draw = Number((row[iDraw] ?? '').trim());
+    if (!Number.isInteger(draw) || draw < 0 || draw > 3) {
+      throw new Error(`entrance card "${id}" draws ${row[iDraw]} cards; it can only draw 0-3`);
+    }
+
+    const face = (row[iFace] ?? '').trim();
+    if (face !== 'up' && face !== 'down') {
+      throw new Error(`entrance card "${id}" says "${face}"; a card is placed up or down`);
+    }
+
+    const placement = parsePlacement(row[iPlace], id);
+    if (placement.kind === 'none' && draw !== 0) {
+      throw new Error(`entrance card "${id}" draws ${draw} cards but places none`);
+    }
+    if (placement.kind === 'fixed' && placement.spaces.length !== draw) {
+      throw new Error(
+        `entrance card "${id}" draws ${draw} card(s) but names ${placement.spaces.length} square(s)`,
+      );
+    }
+
+    cards[id] = {
+      id,
+      draw,
+      face,
+      placement,
+      specials: parseSpecials(row[iSpecial], id),
+      text: (row[iText] ?? '').trim(),
+    };
+  }
+
+  if (Object.keys(cards).length === 0) throw new Error('entrance CSV has no cards');
+  return cards;
+}
+
+/**
+ * Turn the encounter CSV into a map of id -> card.
+ * Expected columns: id, type — nothing else. A card names a kind, not an
+ * effect; the effect lives in that kind's own deck.
+ */
+export function encountersFromCsv(text) {
+  const [header, ...rows] = parseCsv(text);
+  if (!header) throw new Error('encounter CSV is empty');
+
+  const column = (name) => {
+    const index = header.indexOf(name);
+    if (index === -1) throw new Error(`encounter CSV is missing the "${name}" column`);
+    return index;
+  };
+
+  const iId = column('id');
+  const iType = column('type');
+
+  const cards = {};
+  for (const row of rows) {
+    const id = (row[iId] ?? '').trim();
+    if (!id) continue;
+    if (cards[id]) throw new Error(`encounter CSV has a duplicate id: "${id}"`);
+
+    const type = (row[iType] ?? '').trim().toLowerCase();
+    if (!ENCOUNTER_TYPES.includes(type)) {
+      throw new Error(
+        `encounter card "${id}" is a "${type}"; a card is one of ${ENCOUNTER_TYPES.join(', ')}`,
+      );
+    }
+    cards[id] = { id, type };
+  }
+
+  if (Object.keys(cards).length === 0) throw new Error('encounter CSV has no cards');
+  return cards;
+}
+
+/* ------------------------------------------------------------------ *
+ * Item cards
+ *
+ * An encounter card that says Item does not say what the item is: it sends you
+ * to the item deck, and the card you turn over there replaces it. So the item
+ * deck is data like every other — one CSV — and the investigator keeps the card
+ * until they spend it.
+ *
+ * Two columns do the work. `effect` is what the house can already carry out, in
+ * tokens: `clue:1`, `move:2`, `shift:1`, `action:1`, `reveal-room`. A card that
+ * asks for a die writes a roll instead, and the branches are the whole effect:
+ *
+ *   roll:d6/1-3:sanity:-1/4-6:clue:+1
+ *
+ * `needs` names the rule a card is waiting for — monster, event, player, dice,
+ * lock, placement, reorder — so that a card whose rule is not in the game yet is
+ * never silently inert: the table is told exactly what is missing.
+ * ------------------------------------------------------------------ */
+
+const ITEM_COUNTS = [
+  'move',
+  'clue',
+  'shift',
+  'action',
+  'health',
+  'sanity',
+  'pull',
+  'give-clue',
+];
+
+/** One effect is written with a hyphen; the rest are their own name. */
+const ITEM_KEY = { 'give-clue': 'giveClue' };
+
+/** A ward is not a number of something; it stands in front of the next loss. */
+const ITEM_WARDS = { 'sanity-shield': 'sanityShield', 'damage-shield': 'damageShield' };
+
+const NEED_WORD = {
+  monster: 'a monster',
+  event: 'an Event card',
+  player: 'another investigator',
+  dice: 'a die roll',
+  lock: 'a lock',
+  placement: 'a room placed out of turn',
+  reorder: 'the encounter deck put back in order',
+  choice: 'a choice to make',
+};
+
+/**
+ * A die roll written into an effect: `roll:d6/1-3:sanity:-1/4-6:clue:+1`.
+ *
+ * The first part names the die. Slashes separate the branches, and a branch is
+ * `6:` or `1-3:` — the faces it answers to — followed by what happens on them.
+ * A branch may hold two things, written with `;` between them. A face that no
+ * branch names is a real outcome: the die is rolled, the number is said out
+ * loud, and nothing follows. That is why a card that only bites high,
+ * `roll:d6/5-6:clue:+1`, does nothing on a 2 rather than quietly doing the
+ * wrong thing — and why a card needs no "else" written for the low faces.
+ *
+ * Bands are read strictly: backwards, overlapping, off the die, or empty of any
+ * effect are all load errors in a deck a person edits by hand.
+ */
+function parseRoll(value, id, what, readBranch) {
+  const [head, ...bands] = String(value)
+    .split('/')
+    .map((part) => part.trim());
+
+  const die = /^(?:1)?d([1-9][0-9]*)$/.exec(head ?? '');
+  if (!die) {
+    throw new Error(
+      `${what} "${id}" rolls "${head}", which is not a die; write d6 for one six-sided die`,
+    );
+  }
+  const size = Number(die[1]);
+  if (bands.length === 0) {
+    throw new Error(
+      `${what} "${id}" rolls a d${size} but names no band to answer to; write roll:d${size}/1-3:...`,
+    );
+  }
+
+  const branches = [];
+  for (const band of bands) {
+    if (!band) throw new Error(`${what} "${id}" has an empty band in its roll: "${value}"`);
+
+    const colon = band.indexOf(':');
+    const faces = (colon === -1 ? band : band.slice(0, colon)).trim();
+    const body = colon === -1 ? '' : band.slice(colon + 1).trim();
+
+    const range = /^([1-9][0-9]*)(?:-([1-9][0-9]*))?$/.exec(faces);
+    if (!range) {
+      throw new Error(
+        `${what} "${id}" answers to "${faces}"; a band is a face like 6 or a range like 1-3`,
+      );
+    }
+    const min = Number(range[1]);
+    const max = range[2] ? Number(range[2]) : min;
+    if (min > max) {
+      throw new Error(`${what} "${id}" has "${faces}" backwards; the low face comes first`);
+    }
+    if (max > size) {
+      throw new Error(`${what} "${id}" answers to a ${max} on a d${size}`);
+    }
+    if (!body) {
+      throw new Error(`${what} "${id}" has no effect on ${faces}; leave the band out instead`);
+    }
+    for (const other of branches) {
+      if (min <= other.max && other.min <= max) {
+        throw new Error(`${what} "${id}" answers to ${min}-${max} twice; bands cannot overlap`);
+      }
+    }
+
+    branches.push({ min, max, ops: readBranch(body) });
+  }
+  return { kind: 'roll', die: size, branches };
+}
+
+function parseItemEffect(value, id) {
+  const tokens = (value ?? '')
+    .split('|')
+    .map((t) => t.trim())
+    .filter(Boolean);
+  const rolls = tokens.filter((token) => token.startsWith('roll:'));
+
+  // One roll per card: two rolls in a row would still be replayable, but the
+  // second would have no card left to belong to, and the log would say nothing
+  // about which die was which.
+  if (rolls.length > 1) {
+    throw new Error(`item "${id}" rolls a die ${rolls.length} times; a card rolls once`);
+  }
+
+  const out = parseItemFields(
+    tokens.filter((token) => !token.startsWith('roll:')).join('|'),
+    id,
+  );
+  if (rolls.length === 1) {
+    // Inside a branch `;` holds two things together, because `|` already means
+    // "and then this too" between the parts of a card.
+    // A branch is one flat effect, but it is handed on as a list of one so that
+    // an item's roll and an event's roll are carried out the same way.
+    out.roll = parseRoll(rolls[0].slice('roll:'.length), id, 'item', (branch) => [
+      parseItemFields(branch.replaceAll(';', '|'), id),
+    ]);
+  }
+  return out;
+}
+
+/** The flat effect a card carries, read the way it always has been. */
+function parseItemFields(value, id) {
+  const out = {
+    move: 0,
+    clue: 0,
+    shift: 0,
+    action: 0,
+    health: 0,
+    sanity: 0,
+    sanityShield: 0,
+    damageShield: 0,
+    pull: 0,
+    giveClue: 0,
+    revealRoom: false,
+  };
+
+  for (const token of (value ?? '').split('|').map((t) => t.trim()).filter(Boolean)) {
+    if (token === 'reveal-room') {
+      out.revealRoom = true;
+      continue;
+    }
+
+    const match = /^([a-z]+(?:-[a-z]+)?):([+-]?[0-9]+)$/.exec(token);
+    if (!match) {
+      throw new Error(
+        `item "${id}" has "${token}" for an effect, which is not something the table can carry out`,
+      );
+    }
+    const [, rawKey, amount] = match;
+    const key = ITEM_KEY[rawKey] ?? rawKey;
+    const n = Number(amount);
+
+    if (ITEM_WARDS[rawKey]) {
+      if (!Number.isInteger(n) || n < 1) {
+        throw new Error(`item "${id}" puts "${amount}" wards on the table; a ward is one use`);
+      }
+      out[ITEM_WARDS[rawKey]] += n;
+      continue;
+    }
+
+    if (!ITEM_COUNTS.includes(rawKey)) {
+      throw new Error(
+        `item "${id}" changes "${rawKey}"; it can only change ${ITEM_COUNTS.join(', ')}`,
+      );
+    }
+    if (!Number.isInteger(n) || n === 0) {
+      throw new Error(`item "${id}" changes ${key} by "${amount}", which is not a number of anything`);
+    }
+    out[key] += n;
+  }
+  return out;
+}
+
+function parseNeeds(value, id) {
+  const needs = [];
+  for (const token of (value ?? '').split('+').map((t) => t.trim().toLowerCase()).filter(Boolean)) {
+    // Health and Sanity are in the game now, so a card that claims to wait on
+    // one of them is a card whose CSV has not caught up.
+    if (token === 'health' || token === 'sanity') {
+      throw new Error(
+        `"${id}" waits on ${token}, but Health and Sanity are in the game now — give it an effect instead`,
+      );
+    }
+    if (!NEED_WORD[token]) {
+      throw new Error(
+        `item "${id}" waits on "${token}", which is not one of ${Object.keys(NEED_WORD).join(', ')}`,
+      );
+    }
+    if (!needs.includes(token)) needs.push(token);
+  }
+  return needs;
+}
+
+/**
+ * Turn the item CSV into a map of id -> card.
+ * Expected columns: id, name, text, and — if the deck has them — effect, needs.
+ */
+export function itemsFromCsv(text) {
+  const [header, ...rows] = parseCsv(text);
+  if (!header) throw new Error('item CSV is empty');
+
+  const column = (name, required = true) => {
+    const index = header.indexOf(name);
+    if (index === -1) {
+      if (required) throw new Error(`item CSV is missing the "${name}" column`);
+      return -1;
+    }
+    return index;
+  };
+
+  const iId = column('id');
+  const iName = column('name');
+  const iText = column('text');
+  const iEffect = column('effect', false);
+  const iNeeds = column('needs', false);
+
+  const cards = {};
+  for (const row of rows) {
+    const id = (row[iId] ?? '').trim();
+    if (!id) continue;
+    if (cards[id]) throw new Error(`item CSV has a duplicate id: "${id}"`);
+
+    const name = (row[iName] ?? '').trim();
+    if (!name) throw new Error(`item "${id}" has no name`);
+
+    cards[id] = {
+      id,
+      name,
+      effect: parseItemEffect(iEffect === -1 ? '' : row[iEffect], id),
+      needs: parseNeeds(iNeeds === -1 ? '' : row[iNeeds], id),
+      text: (row[iText] ?? '').trim(),
+    };
+  }
+
+  if (Object.keys(cards).length === 0) throw new Error('item CSV has no items');
+  return cards;
+}
+
+/* ------------------------------------------------------------------ *
+ * Investigators
+ *
+ * One CSV for the sheets. A sheet carries the numbers the rest of the game
+ * asks for — Health, Sanity, how many clue tokens can be carried — so a new
+ * investigator is a row and not a code change. The trait lives on the sheet too,
+ * and `traitNeeds` says in plain words what it is waiting for: a trait whose rule
+ * is not in the game yet is never silently inert, the same rule as an item or an
+ * event.
+ * ------------------------------------------------------------------ */
+
+export function investigatorsFromCsv(text) {
+  const [header, ...rows] = parseCsv(text);
+  if (!header) throw new Error('investigator CSV is empty');
+
+  const column = (name, required = true) => {
+    const index = header.indexOf(name);
+    if (index === -1) {
+      if (required) throw new Error(`investigator CSV is missing the "${name}" column`);
+      return -1;
+    }
+    return index;
+  };
+
+  const iId = column('id');
+  const iName = column('name');
+  const iRole = column('role', false);
+  const iHealth = column('health');
+  const iSanity = column('sanity');
+  const iClueLimit = column('clueLimit');
+  const iTrait = column('trait', false);
+  const iTraitText = column('traitText', false);
+  const iTraitNeeds = column('traitNeeds', false);
+  const iBio = column('bio', false);
+
+  const wholeNumber = (row, index, id, what) => {
+    const raw = (row[index] ?? '').trim();
+    const n = Number(raw);
+    if (!Number.isInteger(n) || n < 1) {
+      throw new Error(`investigator "${id}" has "${raw}" for ${what}, which is not a number of ${what}`);
+    }
+    return n;
+  };
+
+  const sheets = {};
+  for (const row of rows) {
+    const id = (row[iId] ?? '').trim();
+    if (!id) continue;
+    if (sheets[id]) throw new Error(`investigator CSV has a duplicate id: "${id}"`);
+
+    const name = (row[iName] ?? '').trim();
+    if (!name) throw new Error(`investigator "${id}" has no name`);
+
+    sheets[id] = {
+      id,
+      name,
+      role: (row[iRole] ?? '').trim(),
+      health: wholeNumber(row, iHealth, id, 'Health'),
+      sanity: wholeNumber(row, iSanity, id, 'Sanity'),
+      clueLimit: wholeNumber(row, iClueLimit, id, 'Clue Limit'),
+      trait: (row[iTrait] ?? '').trim(),
+      traitText: (row[iTraitText] ?? '').trim(),
+      traitNeeds: (row[iTraitNeeds] ?? '').trim(),
+      bio: (row[iBio] ?? '').trim(),
+    };
+  }
+
+  if (Object.keys(sheets).length === 0) throw new Error('investigator CSV has no investigators');
+  return sheets;
+}
+
+/* ------------------------------------------------------------------ *
+ * Event cards
+ *
+ * An encounter card that says Event sends you to the event deck, and the card
+ * that comes off it is read out and played before it is put aside: unlike an
+ * item, it is never kept. So an event is a die roll and a short instruction,
+ * which is exactly what the CSV carries.
+ *
+ *   roll    1-3, 5-6, 6 — the band of the d6 that makes it happen. Blank means
+ *           the card always happens.
+ *   effect  what happens, in tokens: clue:+1, clue:-1, item:+1, step:+2,
+ *           teleport:random-room, teleport:foyer, rotate:nearest,
+ *           investigate-fails, discard-item, swap. Blank means the card waits
+ *           on a rule the house does not have yet, which `needs` names.
+ *
+ * The roll column is the short way to write a card with one band. A card with
+ * two outcomes writes the die into the effect instead and leaves the column
+ * blank: `roll:d6/1-3:sanity:-1/4-6:clue:+1`. Both are the same op once the
+ * deck is read — the column is compiled into it — so there is one dice path.
+ * ------------------------------------------------------------------ */
+
+const EVENT_OPS = [
+  'clue',
+  'item',
+  'step',
+  'health',
+  'sanity',
+  'teleport',
+  'rotate',
+  'investigate-fails',
+  'shuffle-back',
+  'discard-item',
+  'swap',
+];
+
+function parseEventRoll(value, id) {
+  const text = (value ?? '').trim();
+  if (text === '') return null;
+
+  const match = /^([1-6])(?:-([1-6]))?$/.exec(text);
+  if (!match) {
+    throw new Error(`event "${id}" rolls "${text}", which is not a d6 band like 1-3 or 6`);
+  }
+  const min = Number(match[1]);
+  const max = match[2] ? Number(match[2]) : min;
+  if (min > max) {
+    throw new Error(`event "${id}" rolls "${text}" backwards; the low number comes first`);
+  }
+  return { min, max };
+}
+
+function parseEventEffect(value, id) {
+  const ops = [];
+
+  for (const token of (value ?? '').split('|').map((t) => t.trim()).filter(Boolean)) {
+    if (token.startsWith('roll:')) {
+      ops.push(
+        parseRoll(token.slice('roll:'.length), id, 'event', (branch) => parseEventOps(branch, id)),
+      );
+      continue;
+    }
+
+    if (token === 'investigate-fails') {
+      ops.push({ kind: 'investigate-fails' });
+      continue;
+    }
+
+    if (token === 'shuffle-back') {
+      ops.push({ kind: 'shuffle-back' });
+      continue;
+    }
+
+    if (token === 'discard-item' || token === 'swap') {
+      ops.push({ kind: token });
+      continue;
+    }
+
+    const match = /^([a-z-]+):(.*)$/.exec(token);
+    if (!match) {
+      throw new Error(`event "${id}" has "${token}" for an effect, which is not something the table can do`);
+    }
+    const [, kind, argument] = match;
+    if (!EVENT_OPS.includes(kind)) {
+      throw new Error(`event "${id}" has "${token}"; an event can ${EVENT_OPS.join(', ')}`);
+    }
+
+    if (['clue', 'item', 'step', 'health', 'sanity'].includes(kind)) {
+      const n = Number(argument);
+      if (!Number.isInteger(n) || n === 0) {
+        throw new Error(`event "${id}" changes ${kind} by "${argument}", which is not a number of anything`);
+      }
+      ops.push({ kind, n });
+    } else if (kind === 'teleport') {
+      if (!['random-room', 'foyer'].includes(argument)) {
+        throw new Error(`event "${id}" teleports to "${argument}", which is not somewhere this house knows`);
+      }
+      ops.push({ kind, where: argument });
+    } else {
+      if (argument !== 'nearest') {
+        throw new Error(`event "${id}" rotates "${argument}"; the only room it knows how to find is the nearest one`);
+      }
+      ops.push({ kind, where: argument });
+    }
+  }
+  return ops;
+}
+
+/**
+ * One `;`-separated branch of a die roll: the same tokens, all on one band.
+ * Reading each part with the ordinary reader means a branch can do anything a
+ * whole card can — including opening a choice.
+ */
+function parseEventOps(text, id) {
+  return text
+    .split(';')
+    .map((token) => token.trim())
+    .filter(Boolean)
+    .flatMap((token) => parseEventEffect(token, id));
+}
+
+/**
+ * Some cards only bite under a condition: "If you have no items" or "If your
+ * Sanity is 3 or less". It is one column, and it is read strictly so a typo
+ * cannot quietly turn a card into one that always fires.
+ */
+function parseEventWhen(value, id) {
+  const text = (value ?? '').trim().toLowerCase();
+  if (text === '') return null;
+  if (text === 'no-items') return { kind: 'no-items' };
+
+  const match = /^(health|sanity)<=([0-9]+)$/.exec(text);
+  if (!match) {
+    throw new Error(
+      `event "${id}" waits on "${value}"; the when column takes no-items, health<=N or sanity<=N`,
+    );
+  }
+  return { kind: match[1], atMost: Number(match[2]) };
+}
+
+/** Is the card's condition met for this investigator? */
+function whenHolds(player, when) {
+  if (!when) return true;
+  if (when.kind === 'no-items') return (player.items ?? []).length === 0;
+  return typeof player[when.kind] === 'number' && player[when.kind] <= when.atMost;
+}
+
+/** The condition in words, for the log when it is not met. */
+function describeWhen(when) {
+  if (when.kind === 'no-items') return 'nothing at all is being carried';
+  return `${when.kind === 'sanity' ? 'Sanity' : 'Health'} is ${when.atMost} or less`;
+}
+
+/**
+ * Turn the event CSV into a map of id -> card.
+ * Expected columns: id, text, and — if the deck has them — roll, effect, needs.
+ */
+export function eventsFromCsv(text) {
+  const [header, ...rows] = parseCsv(text);
+  if (!header) throw new Error('event CSV is empty');
+
+  const column = (name, required = true) => {
+    const index = header.indexOf(name);
+    if (index === -1) {
+      if (required) throw new Error(`event CSV is missing the "${name}" column`);
+      return -1;
+    }
+    return index;
+  };
+
+  const iId = column('id');
+  const iText = column('text');
+  const iRoll = column('roll', false);
+  const iEffect = column('effect', false);
+  const iWhen = column('when', false);
+  const iNeeds = column('needs', false);
+
+  const cards = {};
+  for (const row of rows) {
+    const id = (row[iId] ?? '').trim();
+    if (!id) continue;
+    if (cards[id]) throw new Error(`event CSV has a duplicate id: "${id}"`);
+
+    cards[id] = {
+      id,
+      roll: parseEventRoll(iRoll === -1 ? '' : row[iRoll], id),
+      effect: parseEventEffect(iEffect === -1 ? '' : row[iEffect], id),
+      when: parseEventWhen(iWhen === -1 ? '' : row[iWhen], id),
+      needs: parseNeeds(iNeeds === -1 ? '' : row[iNeeds], id),
+      text: (row[iText] ?? '').trim(),
+    };
+  }
+
+  if (Object.keys(cards).length === 0) throw new Error('event CSV has no events');
+  return cards;
+}
+
+/**
+ * Roll a die and carry out whichever band answers to the face.
+ *
+ * The face is kept on the state as `lastRoll` — what was rolled, on which die,
+ * and by which card — because a card that mirrors or undoes a roll needs to
+ * know what it is looking at.
+ */
+function runRoll(state, roll, runOp, source) {
+  const value = randomInt(state, roll.die) + 1;
+  const branch = roll.branches.find((band) => value >= band.min && value <= band.max);
+
+  pushLog(state, `The die comes up ${value}${branch ? '' : ' — nothing follows'}.`);
+  state.lastRoll = { value, die: roll.die, source };
+
+  if (branch) for (const op of branch.ops) runOp(op);
+  return value;
+}
+
+/**
+ * Read an event out and do what it says.
+ *
+ * The die is rolled first, because most of the deck is "nothing follows" — the
+ * card is only half the card without the roll. A card whose `needs` is not empty
+ * never reaches here: it was read and put aside with a note about the missing
+ * rule in collectEncounter.
+ */
+function playEvent(state, ctx, event, player) {
+  // A conditional card is read out and then does nothing if the table does not
+  // meet the condition — which is not the same as being pending.
+  if (!whenHolds(player, event.when)) {
+    pushLog(
+      state,
+      `The card only bites when ${describeWhen(event.when)}; that is not the case here, so nothing follows.`,
+    );
+    return;
+  }
+
+  // The roll column is the short form of the same op, so a card read from the
+  // column and a card that writes its die into the effect roll identically.
+  const ops = event.roll
+    ? [
+        {
+          kind: 'roll',
+          die: 6,
+          branches: [{ min: event.roll.min, max: event.roll.max, ops: event.effect }],
+        },
+      ]
+    : event.effect;
+
+  for (const op of ops) applyEventOp(state, ctx, op, player);
+}
+
+function applyEventOp(state, ctx, op, player) {
+  if (op.kind === 'roll') {
+    runRoll(state, op, (inner) => applyEventOp(state, ctx, inner, player), 'an event');
+    return;
+  }
+
+  if (op.kind === 'health' || op.kind === 'sanity') {
+    changePool(state, player, op.kind, op.n, 'this event');
+    return;
+  }
+
+  if (op.kind === 'discard-item') {
+    const held = player.items ?? [];
+    if (held.length === 0) {
+      pushLog(state, 'There is nothing in hand to give up.');
+      return;
+    }
+    beginChoice(state, {
+      kind: 'discard-item',
+      playerId: player.id,
+      prompt: 'The card asks for something out of your hand. Which do you give up?',
+      options: held.map((id) => ({ id, label: ctx.items?.[id]?.name ?? id })),
+    });
+    return;
+  }
+
+  if (op.kind === 'swap') {
+    const others = state.players.filter((someone) => someone.id !== player.id);
+    if (others.length === 0) {
+      pushLog(state, 'There is nobody else here to trade places with.');
+      return;
+    }
+    beginChoice(state, {
+      kind: 'swap',
+      playerId: player.id,
+      prompt: 'The house offers a swap. Who changes places with you?',
+      options: others.map((someone) => ({ id: someone.id, label: someone.name })),
+    });
+    return;
+  }
+
+  if (op.kind === 'clue') {
+    const held = player.clues ?? 0;
+    if (op.n > 0) {
+      player.clues = held + op.n;
+      pushLog(state, `That is ${op.n} clue${op.n === 1 ? '' : 's'} to the good.`);
+      return;
+    }
+    if (held === 0) {
+      pushLog(state, 'There is no clue token to give up.');
+      return;
+    }
+    const lost = Math.min(held, -op.n);
+    player.clues = held - lost;
+    pushLog(state, `${lost} clue token${lost === 1 ? '' : 's'} given up.`);
+    return;
+  }
+
+  if (op.kind === 'item') {
+    let taken = null;
+    for (let i = 0; i < op.n; i++) {
+      const id = drawFrom(state, 'itemDeck', 'itemDiscard', 'item');
+      if (id === null) break;
+      player.items ??= [];
+      player.items.push(id);
+      taken = id;
+    }
+    pushLog(
+      state,
+      taken === null
+        ? 'There is no item left to take.'
+        : `An item is taken — ${ctx.items?.[taken]?.name ?? taken}.`,
+    );
+    return;
+  }
+
+  if (op.kind === 'step') {
+    state.stepsLeft += op.n;
+    pushLog(state, `${op.n} space${op.n === 1 ? '' : 's'} of movement is in hand.`);
+    return;
+  }
+
+  if (op.kind === 'investigate-fails') {
+    state.investigatePenalty = (state.investigatePenalty ?? 0) + 1;
+    pushLog(state, 'The next Investigate action will fail.');
+    return;
+  }
+
+  if (op.kind === 'teleport') {
+    if (op.where === 'foyer') {
+      const [startR, startC] = ctx.scenario.startSpace ?? [1, 1];
+      for (const [id, entry] of Object.entries(state.rooms)) {
+        if (entry.roomId !== ctx.scenario.startRoom) continue;
+        const [R, C] = id.split(',').map(Number);
+        player.pos = posOf(R, C, startR, startC);
+        pushLog(state, `${player.name} is back in the ${ctx.rooms[entry.roomId].name}.`);
+        return;
+      }
+      pushLog(state, 'The Foyer is not on the table, so there is nowhere to go.');
+      return;
+    }
+
+    const here = slotOf(player.pos);
+    const elsewhere = Object.keys(state.rooms).filter((id) => id !== roomKey(here.R, here.C));
+    if (elsewhere.length === 0) {
+      pushLog(state, 'Nothing else has been revealed, so there is nowhere to go.');
+      return;
+    }
+    const [R, C] = elsewhere[randomInt(state, elsewhere.length)].split(',').map(Number);
+    const spot = freeSquareIn(state, { R, C }, player);
+    player.pos = posOf(R, C, spot.r, spot.c);
+    const name = ctx.rooms[state.rooms[roomKey(R, C)].roomId].name;
+    pushLog(state, `${player.name} is elsewhere — the ${name}.`);
+    return;
+  }
+
+  if (op.kind === 'shuffle-back') {
+    // "Shuffle one face-down Encounter Card in your room back into the deck." The
+    // card on a square is a particular card, dealt when it was laid down, so it
+    // can go back where it came from and leave the square empty.
+    const room = slotOf(player.pos);
+    const at = roomKey(room.R, room.C);
+    const key = Object.keys(state.encounters).find(
+      (k) => state.encounters[k].room === at && !state.encounters[k].faceUp,
+    );
+    if (!key) {
+      pushLog(state, 'There is nothing face down in this room to put back.');
+      return;
+    }
+    const marker = state.encounters[key];
+    state.encounterDeck.push(marker.cardId);
+    state.encounterDeck = shuffle(state, state.encounterDeck);
+    delete state.encounters[key];
+    pushLog(
+      state,
+      `The face-down card on [${marker.number}] goes back into the encounter deck, which is shuffled.`,
+    );
+    return;
+  }
+
+  // rotate: the nearest room to the investigator that they are not standing in.
+  const here = slotOf(player.pos);
+  let nearest = null;
+  for (const id of Object.keys(state.rooms)) {
+    const [R, C] = id.split(',').map(Number);
+    if (R === here.R && C === here.C) continue;
+    const distance = Math.abs(R - here.R) + Math.abs(C - here.C);
+    if (
+      !nearest ||
+      distance < nearest.distance ||
+      (distance === nearest.distance && (R < nearest.R || (R === nearest.R && C < nearest.C)))
+    ) {
+      nearest = { R, C, distance };
+    }
+  }
+  if (!nearest) {
+    pushLog(state, 'There is no other room near enough to turn.');
+    return;
+  }
+  rotateRoom(state, ctx, nearest);
+}
+
+/**
+ * Turn one room a quarter clockwise, carrying everything inside it round: the
+ * investigators standing on its squares and the cards lying on its floor.
+ * Returns the slot it turned, or null if nothing is there.
+ */
+function rotateRoom(state, ctx, slot) {
+  const entry = roomEntryAt(state, slot);
+  if (!entry) return null;
+
+  entry.rot = (entry.rot + 1) % 4;
+  for (const player of state.players) {
+    const at = slotOf(player.pos);
+    if (at.R === slot.R && at.C === slot.C) rotateWithRoom(player, slot);
+  }
+  rotateEncounterCards(state, slot);
+
+  pushLog(state, `The ${ctx.rooms[entry.roomId].name} turns a quarter clockwise.`);
+  return { R: slot.R, C: slot.C, roomId: entry.roomId, rot: entry.rot };
+}
+
+/**
+ * Where to put someone who arrives in a room without walking: any square no
+ * other investigator is standing on. Falls back to the middle, because a room
+ * whose whole floor is occupied still has room for one more.
+ */
+function freeSquareIn(state, slot, player) {
+  const taken = new Set(
+    state.players.filter((p) => p.id !== player.id).map((p) => posKey(p.pos)),
+  );
+
+  const free = [];
+  for (let r = 0; r < ROOM_SIZE; r++) {
+    for (let c = 0; c < ROOM_SIZE; c++) {
+      if (!taken.has(posKey(posOf(slot.R, slot.C, r, c)))) free.push({ r, c });
+    }
+  }
+  if (free.length === 0) return { r: DOOR_AT, c: DOOR_AT };
+  return free[randomInt(state, free.length)];
+}
+
+/* ------------------------------------------------------------------ *
+ * Doors and rotation
+ * ------------------------------------------------------------------ */
+
+/**
+ * Where a door ends up after `rot` clockwise quarter-turns.
+ *
+ * Rotating the card clockwise sends a north door to the east side, an east door
+ * to the south side. A north or south door keeps its position along the side;
+ * an east or west door has its position mirrored, because the card turned.
+ */
+function rotateEdge(dir, offset, rot) {
+  let edge = dir;
+  let index = offset;
+  for (let i = 0; i < rot; i++) {
+    if (edge === 'n') {
+      edge = 'e';
+    } else if (edge === 'e') {
+      edge = 's';
+      index = ROOM_SIZE - 1 - index;
+    } else if (edge === 's') {
+      edge = 'w';
+    } else {
+      edge = 'n';
+      index = ROOM_SIZE - 1 - index;
+    }
+  }
+  return { dir: edge, offset: index };
+}
+
+/**
+ * Every door of a room as it stands on the table at rotation `rot`:
+ * { n: [bool, bool, bool], e: [...], s: [...], w: [...] }.
+ */
+export function doorsAt(room, rot) {
+  // Every side has to exist before any door is written onto it: a turned door
+  // lands on a side that may not have been visited yet.
+  const out = {};
+  for (const dir of DIR_KEYS) out[dir] = new Array(ROOM_SIZE).fill(false);
+
+  for (const dir of DIR_KEYS) {
+    for (let offset = 0; offset < ROOM_SIZE; offset++) {
+      if (!room.doors[dir][offset]) continue;
+      const turned = rotateEdge(dir, offset, rot);
+      out[turned.dir][turned.offset] = true;
+    }
+  }
+  return out;
+}
+
+/** How many distinct openings a room presents at that rotation. */
+function openingsAt(room, rot) {
+  const doors = doorsAt(room, rot);
+  return DIR_KEYS.reduce((n, dir) => n + doors[dir].filter(Boolean).length, 0);
+}
+
+/* ------------------------------------------------------------------ *
+ * Deterministic randomness
+ * ------------------------------------------------------------------ */
+
+function normaliseSeed(seed) {
+  const value = Number(seed) >>> 0;
+  return value === 0 ? 0x9e3779b9 : value;
+}
+
+/** xorshift32. Advances state.rngState and returns a 32-bit unsigned int. */
+function nextRandom(state) {
+  let x = state.rngState >>> 0;
+  x ^= x << 13;
+  x >>>= 0;
+  x ^= x >>> 17;
+  x ^= x << 5;
+  x >>>= 0;
+  if (x === 0) x = 0x9e3779b9;
+  state.rngState = x;
+  return x;
+}
+
+function randomInt(state, n) {
+  return nextRandom(state) % n;
+}
+
+/* ------------------------------------------------------------------ *
+ * Setup
+ * ------------------------------------------------------------------ */
+
+export function createGame(ctx, options = {}) {
+  const { scenario, rooms } = ctx;
+  if (!scenario) throw new Error('createGame needs a scenario');
+  if (!rooms) throw new Error('createGame needs rooms');
+
+  const [startSlotR, startSlotC] = scenario.startSlot ?? [0, 0];
+  const [startR, startC] = scenario.startSpace ?? [1, 1];
+
+  if (!rooms[scenario.startRoom]) {
+    throw new Error(`scenario.startRoom "${scenario.startRoom}" is not in the room deck`);
+  }
+  if (startR < 0 || startC < 0 || startR >= ROOM_SIZE || startC >= ROOM_SIZE) {
+    throw new Error('scenario.startSpace must be inside the room, so 0-2 on each axis');
+  }
+
+  const seed = normaliseSeed(options.seed ?? Date.now());
+  const count = options.playerCount ?? scenario.players.default ?? 2;
+  if (count < scenario.players.min || count > scenario.players.max) {
+    throw new Error(`this scenario takes ${scenario.players.min}-${scenario.players.max} players`);
+  }
+  const names =
+    options.playerNames ?? Array.from({ length: count }, (_, i) => `Investigator ${i + 1}`);
+
+  // A seat can be filled from the investigator deck: the sheet brings the name,
+  // the numbers and the trait, so nothing in here knows who Clara is.
+  const sheets = ctx.investigators ?? null;
+  let seats = null;
+  if (sheets) {
+    const available = Object.keys(sheets);
+    if (available.length < count) {
+      throw new Error(
+        `this game needs ${count} investigators and the deck holds ${available.length}`,
+      );
+    }
+    seats = options.investigatorIds ?? available.slice(0, count);
+    if (seats.length !== count) {
+      throw new Error(`${seats.length} investigator(s) were named for ${count} player(s)`);
+    }
+    if (new Set(seats).size !== seats.length) {
+      throw new Error('the same investigator cannot take two seats');
+    }
+    for (const id of seats) {
+      if (!sheets[id]) throw new Error(`there is no investigator "${id}"`);
+    }
+  }
+
+  const start = posOf(startSlotR, startSlotC, startR, startC);
+
+  // Not every room is somewhere the house hands you. The Rift Room is the end of
+  // the story, so it is held out of the shuffle and put at the bottom of the
+  // deck: the last card turned over, never a random draw.
+  const heldBack = scenario.bossRoomAppearsLast ? scenario.bossRoom : null;
+  if (heldBack) {
+    if (!rooms[heldBack]) {
+      throw new Error(`scenario.bossRoom "${heldBack}" is not in the room deck`);
+    }
+    if (heldBack === scenario.startRoom) {
+      throw new Error('the boss room cannot also be the room the game starts in');
+    }
+  }
+
+  const deck = Object.keys(rooms).filter(
+    (id) => id !== scenario.startRoom && id !== heldBack,
+  );
+
+  const state = {
+    scenarioId: scenario.id,
+    seed,
+    rngState: seed,
+    round: 1,
+    turnIndex: 0,
+    actionsLeft: scenario.turn.actionsPerTurn,
+    actionsPerTurn: scenario.turn.actionsPerTurn,
+    moveRange: scenario.turn.moveRange,
+    stepsLeft: 0,
+    shift: { ...scenario.shift },
+    encounterReveal: revealMode(scenario),
+    shiftPressure: 0,
+    drewThisTurn: false,
+    lastShift: null,
+    players: Array.from({ length: count }, (_, i) => {
+      const sheet = seats ? sheets[seats[i]] : null;
+      const player = {
+        id: `p${i + 1}`,
+        name: sheet ? sheet.name : names[i] ?? `Investigator ${i + 1}`,
+        pos: { ...start },
+        items: [],
+        // Clue tokens are held, not pooled: the sheet's Clue Limit is what one
+        // investigator can carry.
+        clues: 0,
+      };
+      if (!sheet) return player;
+      return {
+        ...player,
+        investigatorId: sheet.id,
+        role: sheet.role,
+        health: sheet.health,
+        healthMax: sheet.health,
+        sanity: sheet.sanity,
+        sanityMax: sheet.sanity,
+        clueLimit: sheet.clueLimit,
+      };
+    }),
+    rooms: { [roomKey(startSlotR, startSlotC)]: { roomId: scenario.startRoom, rot: 0 } },
+    roomDeck: [],
+    entranceDeck: [],
+    entranceSeen: [],
+    encounterDeck: [],
+    encounterDiscard: [],
+    itemDeck: [],
+    itemDiscard: [],
+    eventDeck: [],
+    eventDiscard: [],
+    investigatePenalty: 0,
+    encounters: {},
+    shiftTokens: 0,
+    lastEntrance: null,
+    pending: null,
+    choice: null,
+    log: [],
+  };
+
+  // Shuffle once the state exists, so the deck order is drawn from the same RNG
+  // position that every later draw advances.
+  state.roomDeck = shuffle(state, deck);
+  // Draws take from the end, so index 0 is the bottom of the deck.
+  if (heldBack) state.roomDeck.unshift(heldBack);
+
+  // The room entrance deck, if this scenario brings one. It is shuffled after
+  // the rooms so that adding this deck cannot change the order rooms come out
+  // of the house.
+  const entranceIds = ctx.entrances
+    ? Object.keys(ctx.entrances).sort((a, b) => Number(a) - Number(b))
+    : [];
+  state.entranceDeck = shuffle(state, entranceIds);
+
+  // The encounter deck is shuffled last, so a table that leaves it out gets the
+  // same rooms and the same entrance cards out of the same seed.
+  const encounterIds = ctx.encounterCards
+    ? Object.keys(ctx.encounterCards).sort((a, b) => Number(a) - Number(b))
+    : [];
+  state.encounterDeck = shuffle(state, encounterIds);
+
+  // The item deck is shuffled last for the same reason: a table that brings no
+  // items still gets the same house and the same cards out of the same seed.
+  const itemIds = ctx.items
+    ? Object.keys(ctx.items).sort((a, b) => Number(a) - Number(b))
+    : [];
+  state.itemDeck = shuffle(state, itemIds);
+
+  // And the event deck last of the three, for the same reason again.
+  const eventIds = ctx.events
+    ? Object.keys(ctx.events).sort((a, b) => Number(a) - Number(b))
+    : [];
+  state.eventDeck = shuffle(state, eventIds);
+
+  pushLog(
+    state,
+    `The Foyer. ${names.length} investigator${names.length === 1 ? '' : 's'} begin here. Seed ${seed}.`,
+  );
+  return state;
+}
+
+function shuffle(state, list) {
+  const copy = list.slice();
+  for (let i = copy.length - 1; i > 0; i--) {
+    const j = randomInt(state, i + 1);
+    const tmp = copy[i];
+    copy[i] = copy[j];
+    copy[j] = tmp;
+  }
+  return copy;
+}
+
+/* ------------------------------------------------------------------ *
+ * Small state helpers
+ * ------------------------------------------------------------------ */
+
+export function currentPlayer(state) {
+  return state.players[state.turnIndex];
+}
+
+function roomEntryAt(state, slot) {
+  return state.rooms[roomKey(slot.R, slot.C)] ?? null;
+}
+
+function pushLog(state, text) {
+  state.log.push(text);
+  if (state.log.length > 400) state.log.splice(0, state.log.length - 400);
+}
+
+/** Turn a player's position as the card turns, so they stay on their square. */
+function rotateWithRoom(player, slot) {
+  const local = localOf(player.pos);
+  player.pos = posOf(slot.R, slot.C, local.c, ROOM_SIZE - 1 - local.r);
+}
+
+/* ------------------------------------------------------------------ *
+ * Movement legality
+ * ------------------------------------------------------------------ */
+
+/**
+ * Why the player cannot step from `from` to `to`, or null if they can.
+ *
+ * A step inside one room is free. A step that crosses into another room has to
+ * pass a door in the room being left, and — if the room beyond has been placed
+ * — a door in the room being entered, at the same position along the shared
+ * side. That second check is the whole mechanic.
+ */
+export function stepProblem(state, from, to, ctx) {
+  const dir = travelDir(from, to);
+  if (!dir) return 'that space does not share an edge with the current one';
+
+  const here = slotOf(from);
+  const there = slotOf(to);
+  if (here.R === there.R && here.C === there.C) return null;
+
+  const source = roomEntryAt(state, here);
+  if (!source) return 'you are standing in an unexplored part of the house';
+  const sourceRoom = ctx.rooms[source.roomId];
+
+  if (!doorsAt(sourceRoom, source.rot)[dir][DOOR_AT]) {
+    return `the ${sourceRoom.name} has no door on its ${DIR_WORD[dir]} side`;
+  }
+  // The door is the middle of the side, so the wall either side of it is still
+  // wall even when that side has a door. You have to walk to the middle.
+  if (edgeOffset(from, dir) !== DOOR_AT) {
+    return `the ${sourceRoom.name} opens ${DIR_WORD[dir]} only at the middle of that side`;
+  }
+
+  const back = OPPOSITE[dir];
+  const target = roomEntryAt(state, there);
+
+  if (target) {
+    const targetRoom = ctx.rooms[target.roomId];
+    if (!doorsAt(targetRoom, target.rot)[back][DOOR_AT]) {
+      return `the ${targetRoom.name} has no door on its ${DIR_WORD[back]} side`;
+    }
+    return null;
+  }
+
+  // The room deck is the one deck that never replenishes: once every room is on
+  // the table the house is finished, and there is nowhere further to walk.
+  if (state.roomDeck.length === 0) {
+    return 'the house is complete — there is no room left to turn over';
+  }
+  // One new room a turn. Without this, a player who has steps left after laying
+  // a card down can walk straight through it and open a second room on the same
+  // turn, which is not how the house is supposed to explore.
+  if (state.drewThisTurn) {
+    return 'you have already opened a new room this turn, so the dark beyond waits until your next turn';
+  }
+  return null;
+}
+
+/**
+ * Every space the active player can reach with the steps they have left.
+ * Returns [{ pos, path }]. The search does not walk on through unexplored
+ * space: you cannot know what is there until a card has been turned.
+ */
+export function legalDestinations(state, ctx) {
+  if (state.pending || state.choice) return [];
+
+  const allowance =
+    state.stepsLeft > 0 ? state.stepsLeft : state.actionsLeft > 0 ? state.moveRange : 0;
+  if (allowance === 0) return [];
+
+  const player = currentPlayer(state);
+  const results = [];
+  const seen = new Set([`${player.pos.gr},${player.pos.gc}`]);
+  let frontier = [{ pos: player.pos, path: [] }];
+
+  for (let depth = 0; depth < allowance; depth++) {
+    const next = [];
+    for (const node of frontier) {
+      for (const dir of DIRS) {
+        const to = { gr: node.pos.gr + dir.dr, gc: node.pos.gc + dir.dc };
+        const id = `${to.gr},${to.gc}`;
+        if (seen.has(id)) continue;
+        if (stepProblem(state, node.pos, to, ctx)) continue;
+        seen.add(id);
+        const path = [...node.path, to];
+        results.push({ pos: to, path });
+        if (roomEntryAt(state, slotOf(to))) next.push({ pos: to, path });
+      }
+    }
+    frontier = next;
+  }
+  return results;
+}
+
+/** Rotations that would let the drawn card meet the doorway it came through. */
+export function pendingOrientations(state, ctx) {
+  const pending = state.pending;
+  if (!pending || pending.kind !== 'placeRoom') return [];
+  const room = ctx.rooms[pending.roomId];
+  if (!room) return [];
+
+  const dir = travelDir(pending.from, pending.at);
+  if (!dir) return [];
+  const back = OPPOSITE[dir];
+
+  const valid = [];
+  for (let rot = 0; rot < 4; rot++) {
+    if (doorsAt(room, rot)[back][DOOR_AT]) valid.push(rot);
+  }
+  return valid;
+}
+
+/* ------------------------------------------------------------------ *
+ * Actions
+ * ------------------------------------------------------------------ */
+
+export const ACTIONS = ['MOVE', 'INVESTIGATE', 'USE_ITEM', 'PLACE_ROOM', 'CHOOSE', 'END_TURN'];
+
+/**
+ * Apply one action and return the new state. Never mutates `state`.
+ * Throws with a readable message if the action is not allowed.
+ */
+export function reduce(state, action, ctx) {
+  if (!action || typeof action.type !== 'string') {
+    throw new Error('an action must have a type');
+  }
+  const next = structuredClone(state);
+
+  // A card that asks a question owns the table until it is answered.
+  if (next.choice && action.type !== 'CHOOSE') {
+    throw new Error('answer the choice on the table before doing anything else');
+  }
+
+  switch (action.type) {
+    case 'CHOOSE':
+      return doChoose(next, action, ctx);
+    case 'MOVE':
+      return doMove(next, action, ctx);
+    case 'PLACE_ROOM':
+      return doPlace(next, action, ctx);
+    case 'INVESTIGATE':
+      return doInvestigate(next, ctx);
+    case 'USE_ITEM':
+      return doUseItem(next, action, ctx);
+    case 'END_TURN':
+      return doEndTurn(next, ctx);
+    default:
+      throw new Error(`unknown action type "${action.type}"`);
+  }
+}
+
+function doMove(state, action, ctx) {
+  if (state.pending) throw new Error('place the drawn room before doing anything else');
+
+  const path = action.path;
+  if (!Array.isArray(path) || path.length === 0) {
+    throw new Error('MOVE needs a non-empty path');
+  }
+
+  // A Move action buys the whole allowance at once. Steps left over after a
+  // pause to turn a card stay available, so stepping into the unknown and then
+  // walking on is still one action, the way it is at the table.
+  if (state.stepsLeft === 0) {
+    if (state.actionsLeft <= 0) throw new Error('no actions left this turn');
+    state.actionsLeft -= 1;
+    state.stepsLeft = state.moveRange;
+  }
+  if (path.length > state.stepsLeft) {
+    throw new Error(
+      `only ${state.stepsLeft} more space${state.stepsLeft === 1 ? '' : 's'} left in this move`,
+    );
+  }
+
+  return advance(
+    state,
+    path.map((p) => ({ gr: p.gr, gc: p.gc })),
+    ctx,
+    currentPlayer(state).id,
+  );
+}
+
+/**
+ * Investigating the square you are standing on.
+ *
+ * A card face down under your feet is not just a nuisance to be walked over: one
+ * of the turn's two actions turns it over deliberately. That is what makes the
+ * entrance cards worth printing — a card laid on [4] can be read by walking to
+ * it and investigating, rather than hoping the end of a turn catches it.
+ *
+ * Why the investigator cannot investigate, or null if they can.
+ */
+export function investigateProblem(state) {
+  if (state.pending) return 'place the drawn room before doing anything else';
+  if (state.choice) return 'answer the choice on the table first';
+  if (state.actionsLeft <= 0) return 'no actions left this turn';
+
+  const marker = state.encounters?.[posKey(currentPlayer(state).pos)];
+  if (!marker) return 'there is no encounter card on this square to investigate';
+  if (marker.collected) return 'there is nothing left to take from this square';
+  return null;
+}
+
+function doInvestigate(state, ctx) {
+  const problem = investigateProblem(state);
+  if (problem) throw new Error(problem);
+
+  const player = currentPlayer(state);
+  const key = posKey(player.pos);
+  const number = state.encounters[key].number;
+
+  // Looking into it is an action, not a free peek.
+  state.actionsLeft -= 1;
+
+  // "Your next Investigate action fails": the action is spent, the card stays
+  // face down, and the debt is paid.
+  if ((state.investigatePenalty ?? 0) > 0) {
+    state.investigatePenalty -= 1;
+    pushLog(
+      state,
+      `${player.name} investigates the card on [${number}], but finds nothing — that look was doomed.`,
+    );
+    return state;
+  }
+
+  pushLog(state, `${player.name} investigates the card on [${number}].`);
+  // Reading it and taking it up are one action when you are the one who walked
+  // over: the card turns over, and what it calls for is collected at once.
+  turnUp(state, ctx, key, 'the investigator looked into it');
+  collectEncounter(state, ctx, key);
+  return state;
+}
+
+/* ------------------------------------------------------------------ *
+ * Items in hand
+ *
+ * An item is picked up when an encounter card calls one, and kept until it is
+ * spent. Using it costs no action: Dusty Pocketwatch hands back an action, and
+ * a card that costs one to play would then be a card that does nothing.
+ * ------------------------------------------------------------------ */
+
+/**
+ * Why this investigator cannot use an item, or null if they can.
+ * The reason doubles as the tooltip on the card in the hand.
+ */
+export function useItemProblem(state, ctx, itemId) {
+  if (state.pending) return 'place the drawn room before doing anything else';
+  if (state.choice) return 'answer the choice on the table first';
+
+  const player = currentPlayer(state);
+  const id = String(itemId ?? '');
+  if (!(player.items ?? []).includes(id)) return "that item is not in this investigator's hand";
+
+  const item = ctx.items?.[id];
+  if (!item) return `unknown item "${id}"`;
+
+  if (item.needs.length > 0) {
+    const words = item.needs.map((need) => NEED_WORD[need]);
+    return `the ${item.name} is still pending: it needs ${words.join(' and ')}, which the game does not have yet, so it does nothing for now`;
+  }
+  return null;
+}
+
+function doUseItem(state, action, ctx) {
+  const problem = useItemProblem(state, ctx, action.itemId);
+  if (problem) throw new Error(problem);
+
+  const player = currentPlayer(state);
+  const id = String(action.itemId);
+  const item = ctx.items[id];
+
+  player.items.splice(player.items.indexOf(id), 1);
+  state.itemDiscard.push(id);
+  pushLog(state, `${player.name} uses the ${item.name} — ${item.text}`);
+  applyItemEffect(state, ctx, item, player);
+  return state;
+}
+
+/**
+ * Move one pool — Health or Sanity — and say what happened.
+ *
+ * Nothing is invented at zero. The rulebook has not said what a collapsed
+ * investigator does, so the pool stops at 0, the table is told, and they stay on
+ * their feet. A ward is one use: the item is spent when it is played and it
+ * takes the whole of the next source, because one card is one source.
+ */
+function changePool(state, player, pool, amount, source) {
+  const word = pool === 'sanity' ? 'Sanity' : 'Health';
+  const max = player[`${pool}Max`];
+
+  // A seat with no sheet has nothing to move. The card is still spent and still
+  // says why it did nothing.
+  if (typeof player[pool] !== 'number') {
+    pushLog(state, `${player.name} has no ${word} on their sheet, so ${source} leaves them be.`);
+    return;
+  }
+
+  if (amount < 0) {
+    const wardKey = pool === 'sanity' ? 'sanityShield' : 'damageShield';
+    if ((player[wardKey] ?? 0) > 0) {
+      player[wardKey] -= 1;
+      const charm = player[`${wardKey}Name`] ?? 'charm';
+      pushLog(
+        state,
+        `${player.name} is warded: the ${charm} absorbs ${source}, so no ${word} is lost.`,
+      );
+      return;
+    }
+
+    const before = player[pool];
+    const lost = Math.min(before, -amount);
+    player[pool] = before - lost;
+    pushLog(
+      state,
+      lost === 0
+        ? `${player.name} has no ${word} left to lose (0 of ${max}).`
+        : `${player.name} loses ${lost} ${word} (${source}) — ${player[pool]} of ${max} left.`,
+    );
+    if (before > 0 && player[pool] === 0) {
+      pushLog(
+        state,
+        `${player.name} is at 0 ${word}. Nothing in the base game knocks anyone out — the pools colour the mood and nothing more — so they play on.`,
+      );
+    }
+    return;
+  }
+
+  const before = player[pool];
+  player[pool] = Math.min(max, before + amount);
+  const gained = player[pool] - before;
+  pushLog(
+    state,
+    gained === 0
+      ? `${player.name} is already at full ${word} (${before} of ${max}), so ${source} gives them nothing more.`
+      : `${player.name} regains ${gained} ${word} (${source}) — ${player[pool]} of ${max}.`,
+  );
+}
+
+/* ------------------------------------------------------------------ *
+ * Choices
+ *
+ * Some cards cannot be carried out without being told who or what they mean:
+ * "discard an item", "switch places with another player". The card is paused
+ * rather than guessed at, and the table is asked. What is asked is plain data —
+ * a kind, a question and a list of options — so a game replayed from its seed
+ * and its actions asks exactly the same question in the same order.
+ * ------------------------------------------------------------------ */
+
+function beginChoice(state, choice) {
+  state.choice = choice;
+  pushLog(state, choice.prompt);
+}
+
+function doChoose(state, action, ctx) {
+  const choice = state.choice;
+  if (!choice) throw new Error('there is no choice waiting to be made');
+
+  const picked = choice.options.find((option) => String(option.id) === String(action.optionId));
+  if (!picked) {
+    throw new Error(
+      `"${action.optionId}" is not one of the choices: ${choice.options.map((o) => o.id).join(', ')}`,
+    );
+  }
+
+  state.choice = null;
+  resolveChoice(state, ctx, choice, picked);
+  return state;
+}
+
+function resolveChoice(state, ctx, choice, picked) {
+  const chooser = state.players.find((player) => player.id === choice.playerId);
+  if (!chooser) throw new Error('the choice names an investigator who is not at the table');
+
+  // A card in hand is the only choice whose answer is not an investigator.
+  if (choice.kind === 'discard-item') {
+    chooser.items.splice(chooser.items.indexOf(picked.id), 1);
+    state.itemDiscard.push(picked.id);
+    pushLog(state, `${chooser.name} gives up the ${picked.label}.`);
+    return;
+  }
+
+  const other = state.players.find((player) => player.id === picked.id);
+  if (!other) throw new Error('the choice names an investigator who is not at the table');
+
+  if (choice.kind === 'swap') {
+    const there = { ...chooser.pos };
+    chooser.pos = { ...other.pos };
+    other.pos = there;
+    pushLog(state, `${chooser.name} and ${other.name} change places.`);
+    return;
+  }
+
+  if (choice.kind === 'give-clue') {
+    other.clues = (other.clues ?? 0) + 1;
+    pushLog(state, `${other.name} takes the token — one clue to the good.`);
+    return;
+  }
+
+  if (choice.kind === 'pull') {
+    const moved = drawToward(state, ctx, other, chooser.pos, choice.spaces ?? 1);
+    pushLog(
+      state,
+      moved === 0
+        ? `${other.name} has no way through to ${chooser.name}.`
+        : `${other.name} is drawn ${moved} space${moved === 1 ? '' : 's'} toward ${chooser.name}.`,
+    );
+    return;
+  }
+
+  throw new Error(`the choice "${choice.kind}" is not one the table knows how to carry out`);
+}
+
+/**
+ * Walk someone else's investigator toward a square, one space at a time.
+ *
+ * A card does the moving, so it costs nobody an action. It only ever steps into
+ * a room already on the table: opening a new one is something an investigator
+ * does themselves, walking into the dark.
+ */
+function drawToward(state, ctx, player, target, spaces) {
+  const gap = (pos) => Math.abs(pos.gr - target.gr) + Math.abs(pos.gc - target.gc);
+  let moved = 0;
+
+  for (let step = 0; step < spaces; step++) {
+    if (gap(player.pos) === 0) break;
+    const options = DIRS.map((dir) => ({ gr: player.pos.gr + dir.dr, gc: player.pos.gc + dir.dc }))
+      .filter((to) => gap(to) < gap(player.pos))
+      .filter((to) => roomEntryAt(state, slotOf(to)))
+      .filter((to) => !stepProblem(state, player.pos, to, ctx))
+      .sort((a, b) => gap(a) - gap(b));
+
+    if (options.length === 0) break;
+    player.pos = options[0];
+    moved += 1;
+  }
+  return moved;
+}
+
+/** What a used item does to the table. */
+function applyItemEffect(state, ctx, item, player) {
+  applyItemFields(state, ctx, item, player, item.effect);
+}
+
+/** One flat effect — a whole card, or one band of the die it rolls. */
+function applyItemFields(state, ctx, item, player, effect) {
+  if (effect.roll) {
+    runRoll(
+      state,
+      effect.roll,
+      (branch) => applyItemFields(state, ctx, item, player, branch),
+      `the ${item.name}`,
+    );
+  }
+
+  if (effect.move) {
+    state.moveRange += effect.move;
+    // Part-way through a move the extra steps are added to what is left rather
+    // than promised for later: "this turn" includes the move already under way.
+    if (state.stepsLeft > 0) state.stepsLeft += effect.move;
+    pushLog(
+      state,
+      `The extra movement puts ${effect.move} more space${effect.move === 1 ? '' : 's'} in their stride this turn.`,
+    );
+  }
+
+  if (effect.action) {
+    state.actionsLeft += effect.action;
+    pushLog(state, `${effect.action} extra action${effect.action === 1 ? ' is' : 's are'} taken now.`);
+  }
+
+  if (effect.clue) {
+    player.clues = (player.clues ?? 0) + effect.clue;
+    pushLog(state, `That is ${effect.clue} clue${effect.clue === 1 ? '' : 's'} to the good.`);
+  }
+
+  if (effect.shift) markShiftPoint(state, effect.shift);
+
+  if (effect.health) changePool(state, player, 'health', effect.health, `the ${item.name}`);
+  if (effect.sanity) changePool(state, player, 'sanity', effect.sanity, `the ${item.name}`);
+
+  if (effect.giveClue || effect.pull) {
+    const others = state.players.filter((someone) => someone.id !== player.id);
+    if (others.length === 0) {
+      pushLog(state, `The ${item.name} has nobody else to reach for.`);
+    } else if (effect.giveClue) {
+      beginChoice(state, {
+        kind: 'give-clue',
+        playerId: player.id,
+        prompt: `Who takes the token the ${item.name} offers?`,
+        options: others.map((someone) => ({ id: someone.id, label: someone.name })),
+      });
+    } else {
+      beginChoice(state, {
+        kind: 'pull',
+        playerId: player.id,
+        prompt: `Who is drawn toward ${player.name}?`,
+        options: others.map((someone) => ({ id: someone.id, label: someone.name })),
+        spaces: effect.pull,
+      });
+    }
+  }
+
+  if (effect.sanityShield) {
+    player.sanityShield = (player.sanityShield ?? 0) + effect.sanityShield;
+    player.sanityShieldName = item.name;
+    pushLog(state, 'The next source of Sanity loss will be ignored.');
+  }
+
+  if (effect.damageShield) {
+    player.damageShield = (player.damageShield ?? 0) + effect.damageShield;
+    player.damageShieldName = item.name;
+    pushLog(state, 'The next wound taken will be ignored, whatever it is dealt by.');
+  }
+
+  if (effect.revealRoom) {
+    const slot = slotOf(player.pos);
+    const here = roomKey(slot.R, slot.C);
+    const hidden = Object.keys(state.encounters).filter(
+      (key) => state.encounters[key].room === here && !state.encounters[key].faceUp,
+    );
+    if (hidden.length === 0) {
+      pushLog(state, 'Nothing in this room is face down, so the lantern shows nothing new.');
+    }
+    // turnUp deletes the marker when what is under it leaves the square, so the
+    // keys are read from a snapshot taken first.
+    for (const key of hidden) turnUp(state, ctx, key, 'the lantern was held up');
+  }
+}
+
+/**
+ * Mark shift points: the house comes one step closer to turning. It is the same
+ * bar the round-end roll uses, so a point does what a quiet round does, only now
+ * rather than at the end of the round. Two points stack.
+ */
+function markShiftPoint(state, points) {
+  const ladder = state.shift.ladder ?? [5, 4, 3, 2, 1, 0];
+  const from = Math.min(state.shiftPressure, ladder.length - 1);
+  state.shiftPressure = Math.min(from + points, ladder.length - 1);
+  state.shiftTokens += points;
+
+  const bar = ladder[state.shiftPressure];
+  pushLog(
+    state,
+    state.shiftPressure === from
+      ? 'A Shift Point is marked, but the house is already turning of its own accord this round.'
+      : bar > 0
+        ? `A Shift Point is marked: the house shifts on ${bar + 1}+ at the end of this round.`
+        : 'A Shift Point is marked: the house turns of its own accord at the end of this round.',
+  );
+}
+
+/**
+ * Walk the player one space at a time. Stepping into an unexplored slot draws a
+ * card and pauses; the card has to be turned and placed before the walk resumes.
+ */
+function advance(state, steps, ctx, playerId) {
+  const player = state.players.find((p) => p.id === playerId);
+  if (!player) throw new Error(`unknown player "${playerId}"`);
+
+  while (steps.length > 0) {
+    const to = steps[0];
+    const from = player.pos;
+    const problem = stepProblem(state, from, to, ctx);
+    if (problem) throw new Error(problem);
+
+    const here = slotOf(from);
+    const there = slotOf(to);
+    const sameRoom = here.R === there.R && here.C === there.C;
+
+    if (sameRoom) {
+      player.pos = to;
+      state.stepsLeft -= 1;
+      steps.shift();
+      continue;
+    }
+
+    const target = roomEntryAt(state, there);
+    if (target) {
+      player.pos = to;
+      state.stepsLeft -= 1;
+      pushLog(state, `${player.name} passes into the ${ctx.rooms[target.roomId].name}.`);
+      // Walking back into a room is entering it, so a room already on the table
+      // still hands out a room entrance card.
+      resolveEntrance(state, ctx, there, to);
+      flipForSecondPlayer(state, ctx, there);
+      steps.shift();
+      continue;
+    }
+
+    // Unexplored: draw the top card. Every card carries a door on some side, so
+    // it can always be turned to open onto the doorway it was reached through.
+    const roomId = state.roomDeck.pop();
+    // The room deck is the one deck that does not replenish: once every room is
+    // on the table there is no house left to open, only the one you are in.
+    if (!roomId) {
+      throw new Error('the house is complete — there is no room left to turn over');
+    }
+
+    player.pos = to;
+    state.stepsLeft -= 1;
+    state.drewThisTurn = true;
+    state.pending = {
+      kind: 'placeRoom',
+      playerId: player.id,
+      at: to,
+      from: { ...from },
+      roomId,
+    };
+    pushLog(state, `${player.name} steps into the dark and draws the ${ctx.rooms[roomId].name}.`);
+    return state;
+  }
+  return state;
+}
+
+function doPlace(state, action, ctx) {
+  const pending = state.pending;
+  if (!pending || pending.kind !== 'placeRoom') {
+    throw new Error('no room is waiting to be placed');
+  }
+  const room = ctx.rooms[pending.roomId];
+  if (!room) throw new Error(`unknown room "${pending.roomId}"`);
+
+  const rot = Number(action.orient);
+  if (!Number.isInteger(rot) || rot < 0 || rot > 3) {
+    throw new Error('orient must be 0, 1, 2 or 3 (quarter turns clockwise)');
+  }
+
+  const dir = travelDir(pending.from, pending.at);
+  if (!dir) throw new Error('the drawn card is not next to the space that was entered');
+  const back = OPPOSITE[dir];
+  if (!doorsAt(room, rot)[back][DOOR_AT]) {
+    throw new Error(
+      `the ${room.name} has no door on its ${DIR_WORD[back]} side, so the way in would be walled off`,
+    );
+  }
+
+  const slot = slotOf(pending.at);
+  state.rooms[roomKey(slot.R, slot.C)] = { roomId: pending.roomId, rot };
+  pushLog(
+    state,
+    `The ${room.name} is set down, turned ${rot * 90}°, with ${openingsAt(room, rot)} opening${openingsAt(room, rot) === 1 ? '' : 's'}.`,
+  );
+  // Entering the room is what turns the entrance card: the investigator is now
+  // standing on the square just inside the doorway, and everything else follows
+  // from that square.
+  resolveEntrance(state, ctx, slot, pending.at);
+
+  state.pending = null;
+
+  // No automatic continuation: at the table you look at the card you drew before
+  // deciding whether to keep walking, and the unspent step stays yours.
+  return state;
+}
+
+function doEndTurn(state, ctx) {
+  if (state.pending) throw new Error('place the drawn room before ending the turn');
+
+  const player = currentPlayer(state);
+  pushLog(state, `${player.name} ends their turn.`);
+  state.actionsLeft = 0;
+  state.stepsLeft = 0;
+  state.drewThisTurn = false;
+  // Movement bought with an item lasts one turn, so the allowance goes back to
+  // what the scenario printed before the next investigator starts.
+  state.moveRange = ctx.scenario.turn.moveRange;
+
+  // A scenario may still turn cards up at the end of a turn, while the
+  // investigator is standing where they stopped — see revealAtEndOfTurn. The
+  // mansion does not: looking into a card costs one of the turn's two actions.
+  revealAtEndOfTurn(state, ctx, player);
+
+  if (state.turnIndex + 1 < state.players.length) {
+    state.turnIndex += 1;
+    state.actionsLeft = state.actionsPerTurn;
+    return state;
+  }
+
+  // Everyone has acted: the round ends and the corridors may shift. The die goes
+  // round the table one player per round, so nobody rolls twice running.
+  const endingRound = state.round;
+  // Cards timed to the end of a round go over before the house moves, so the
+  // table sees them before the corridors turn.
+  flipAtRoundEnd(state, ctx, endingRound);
+  const roller = state.players[(endingRound - 1) % state.players.length];
+  state.lastShift = resolveShift(state, endingRound, roller, ctx);
+  state.round = endingRound + 1;
+  state.turnIndex = 0;
+  state.actionsLeft = state.actionsPerTurn;
+  return state;
+}
+
+/* ------------------------------------------------------------------ *
+ * Shift phase
+ * ------------------------------------------------------------------ */
+
+/**
+ * End-of-round shift.
+ *
+ * One player rolls a d6 and has to roll higher than the bar. The bar starts at 5
+ * and drops by one for every round the house has stood still, so the first round
+ * wants a 6, then 5+, 4+, 3+, 2+, and on the sixth round without a shift the bar
+ * reaches zero — zero because a d6 is never lower than one, so it always beats
+ * it, and the house turns of its own accord. A shift of any kind, rolled or
+ * automatic, puts the bar straight back to 5.
+ *
+ * A Shift Point marked by a room entrance card pulls the bar down a step early,
+ * exactly as if a quiet round had gone by — see resolveEntrance.
+ *
+ * The ladder lives in the scenario as data, so a scenario that wants a gentler
+ * house changes one list rather than the rules.
+ *
+ * A shift turns every room orthogonally next to the roller's room a quarter
+ * clockwise. Investigators inside a turning room turn with it, ending up in the
+ * square the card carried them to — which is why walking can become a trap.
+ */
+function resolveShift(state, round, roller, ctx) {
+  const cfg = state.shift;
+  const ladder = cfg.ladder ?? [5, 4, 3, 2, 1, 0];
+  const step = Math.min(state.shiftPressure, ladder.length - 1);
+  const bar = ladder[step];
+  const needed = bar > 0 ? bar + 1 : null;
+  let roll = null;
+  let occurs;
+
+  if (bar <= 0) {
+    occurs = true;
+    pushLog(
+      state,
+      `Round ${round}: ${roller.name} rolls for the shift — the house has stood still ${step + 1} rounds, so it turns of its own accord.`,
+    );
+  } else {
+    roll = randomInt(state, cfg.die) + 1;
+    occurs = roll > bar;
+    pushLog(
+      state,
+      `Round ${round}: ${roller.name} rolls ${roll} for the shift, needs ${needed}+. ${
+        occurs ? 'The corridors twist.' : 'Nothing moves.'
+      }`,
+    );
+  }
+
+  if (!occurs) {
+    state.shiftPressure += 1;
+    return { occurred: false, round, roll, roller: roller.id, needed, rotated: [] };
+  }
+
+  state.shiftPressure = 0;
+  const rotated = [];
+  const slot = slotOf(roller.pos);
+
+  for (const dir of DIRS) {
+    const near = { R: slot.R + dir.dr, C: slot.C + dir.dc };
+    const entry = roomEntryAt(state, near);
+    if (!entry) continue;
+    const room = ctx.rooms[entry.roomId];
+    if (cfg.exemptRooms?.includes(entry.roomId)) {
+      pushLog(state, `The ${room.name} holds its shape.`);
+      continue;
+    }
+
+    const turned = rotateRoom(state, ctx, near);
+    if (turned) rotated.push(turned);
+  }
+
+  if (rotated.length === 0) pushLog(state, 'Nothing near enough to move.');
+  return { occurred: true, round, roll, roller: roller.id, needed, rotated };
+}
+
+/* ------------------------------------------------------------------ *
+ * Room entrance resolution
+ * ------------------------------------------------------------------ */
+
+function posOfNumber(slot, number) {
+  const r = Math.floor((number - 1) / ROOM_SIZE);
+  const c = (number - 1) % ROOM_SIZE;
+  return posOf(slot.R, slot.C, r, c);
+}
+
+function numberOfPos(pos) {
+  const local = localOf(pos);
+  return local.r * ROOM_SIZE + local.c + 1;
+}
+
+const posKey = (pos) => `${pos.gr},${pos.gc}`;
+
+function listSquares(numbers) {
+  const marks = numbers.map((n) => `[${n}]`);
+  if (marks.length <= 1) return marks.join('');
+  return `${marks.slice(0, -1).join(', ')} and ${marks[marks.length - 1]}`;
+}
+
+/**
+ * Which square the next card goes on.
+ *
+ * Fixed placements simply read down the list. Everything else has to choose,
+ * and the choice is made from the squares that are actually free: a square with
+ * a card on it already, or with an investigator standing on it, is not free for
+ * a card that has to be put somewhere sensible.
+ */
+function chooseSquare(state, placement, slot, entry, taken, index) {
+  if (placement.kind === 'fixed') return placement.spaces[index] ?? null;
+
+  const free = [];
+  for (let n = 1; n <= SPACE_NUMBERS; n++) {
+    if (taken.has(n)) continue;
+    if (state.encounters[posKey(posOfNumber(slot, n))]) continue;
+    free.push(n);
+  }
+  if (free.length === 0) return null;
+
+  if (placement.kind === 'random') return free[randomInt(state, free.length)];
+
+  let pool;
+  if (placement.kind === 'corners') {
+    pool = free.filter((n) => CORNER_SPACES.includes(n));
+  } else if (placement.kind === 'edges') {
+    pool = free.filter((n) => EDGE_SPACES.includes(n));
+  } else {
+    // nearest and farthest are measured from the square the investigator came in
+    // on. They are standing on it, so it is never a candidate for either.
+    const stood = new Set(state.players.map((p) => posKey(p.pos)));
+    pool = free.filter((n) => !stood.has(posKey(posOfNumber(slot, n))));
+    if (pool.length === 0) return null;
+    const away = (n) => {
+      const pos = posOfNumber(slot, n);
+      return Math.abs(pos.gr - entry.gr) + Math.abs(pos.gc - entry.gc);
+    };
+    const best =
+      placement.kind === 'nearest'
+        ? Math.min(...pool.map(away))
+        : Math.max(...pool.map(away));
+    pool = pool.filter((n) => away(n) === best);
+  }
+
+  return pool.length > 0 ? pool[randomInt(state, pool.length)] : null;
+}
+
+/**
+ * Take the top card of a deck, shuffling its discards back in when it runs dry.
+ *
+ * Every deck in the house replenishes this way. The room deck is the one
+ * exception: there are only so many rooms, and when they are all on the table
+ * the house is finished and the investigators have to live in it.
+ */
+function drawFrom(state, deckName, discardName, label) {
+  if (state[deckName].length === 0) {
+    if (state[discardName].length === 0) return null;
+    state[deckName] = shuffle(state, state[discardName]);
+    state[discardName] = [];
+    pushLog(state, `The ${label} deck is spent, so its cards are shuffled and it begins again.`);
+  }
+  return state[deckName].pop();
+}
+
+/**
+ * Take the next room entrance card.
+ *
+ * Because every entry draws — including walking back into a room you already
+ * know — the deck is asked for far more cards than it holds, so it replenishes.
+ */
+function drawEntrance(state) {
+  const id = drawFrom(state, 'entranceDeck', 'entranceSeen', 'room entrance');
+  if (id === null) {
+    pushLog(state, 'The room entrance deck is spent. This room is entered in silence.');
+  }
+  return id;
+}
+
+/**
+ * Put an encounter card on one square of a room.
+ *
+ * The card is dealt here, when it is laid down, not when it is turned over: a
+ * card lying face down on the table is a particular card already, exactly as it
+ * would be in a hand of cards, and two effects depend on that being true — card
+ * 18 shuffles one back into the deck, and the Mirror Shard looks at the top of
+ * it. What is under it stays hidden until someone turns it, because `type` is
+ * left empty until then and nothing should read a card's kind off a face-down
+ * square.
+ *
+ * Returns how the placement went, because "that square is taken" and "there is
+ * no card left to deal" want different words at the table.
+ */
+function placeEncounter(state, ctx, slot, number, card) {
+  const key = posKey(posOfNumber(slot, number));
+  if (state.encounters[key]) return 'occupied';
+
+  const id = drawFrom(state, 'encounterDeck', 'encounterDiscard', 'encounter');
+  if (id === null) return 'empty';
+
+  state.encounters[key] = {
+    entranceId: card.id,
+    room: roomKey(slot.R, slot.C),
+    number,
+    cardId: id,
+    type: null,
+    faceUp: false,
+    flip: card.specials.flip,
+    flipRound: card.specials.flip === 'end-of-next-round' ? state.round + 1 : null,
+  };
+  return 'placed';
+}
+
+function turnUp(state, ctx, key, why) {
+  const marker = state.encounters[key];
+  if (!marker || marker.faceUp) return;
+
+  const [R, C] = marker.room.split(',').map(Number);
+  const entry = state.rooms[roomKey(R, C)];
+  const name = entry ? ctx.rooms[entry.roomId].name : 'room';
+  pushLog(state, `A face-down encounter card turns over in the ${name} — ${why}.`);
+
+  // revealEncounter is the one place that turns a card over and reads it, so it
+  // is also the one place that knows what a card is. Turning it over says what it
+  // is and nothing more: what it is worth is taken up by investigating it.
+  revealEncounter(state, ctx, key);
+}
+
+/**
+ * What was under the card, and what it is replaced by.
+ *
+ * An encounter card is not the thing itself: it names which of the house's decks
+ * to turn to, and is then replaced by whatever comes off it. A Clue and a
+ * Nothing are the whole of their own answer — the token goes to the investigator
+ * and the card is taken off the square, so nothing is left lying there. The
+ * other three call a deck of their own. An Item is taken into the investigator's
+ * hand and the square is cleared. Monster and Event decks are not in the game
+ * yet, so those cards stay where they are with their type showing rather than
+ * vanishing with their news untold. When those decks arrive, this is the one
+ * place that has to learn what they put on the table.
+ */
+/**
+ * Turn a card over: the encounter deck says what it is.
+ *
+ * This is all a reveal does. What the card is worth is taken up separately, in
+ * collectEncounter, because a card laid face up by an entrance card — or turned
+ * by a lantern, or by a second investigator walking into the room — tells you
+ * what is lying there without putting anything in your hands. You still have to
+ * walk over and look.
+ */
+function revealEncounter(state, ctx, key) {
+  if (!ctx.encounterCards) return null;
+  const marker = state.encounters[key];
+  // The card was dealt when it was laid; turning it over is only the moment it
+  // stops being hidden.
+  if (!marker || marker.faceUp) return null;
+
+  const card = ctx.encounterCards[marker.cardId];
+  if (!card) throw new Error(`unknown encounter card "${marker.cardId}"`);
+
+  marker.faceUp = true;
+  marker.type = card.type;
+
+  // An Item is a card of its own, laid face up beside the encounter card, so
+  // whoever turns this one can see exactly which item is lying there — it is the
+  // item that waits to be taken up, not the knowledge of it.
+  if (card.type === 'item') {
+    const itemId = drawFrom(state, 'itemDeck', 'itemDiscard', 'item');
+    if (itemId === null) {
+      pushLog(state, `It is an Item on [${marker.number}], but that deck is spent and empty.`);
+    } else {
+      marker.itemId = itemId;
+      const item = ctx.items?.[itemId];
+      pushLog(state, `It is an Item — ${item ? item.name : itemId} — lying on [${marker.number}].`);
+    }
+    return card;
+  }
+
+  const word = ENCOUNTER_WORD[card.type];
+  pushLog(
+    state,
+    `It is ${/^[AEIOU]/.test(word) ? 'an' : 'a'} ${word}, showing on [${marker.number}].`,
+  );
+  return card;
+}
+
+/**
+ * Take up a card that has been turned over — the whole point of investigating.
+ *
+ * A Clue and a Nothing are the whole of their own answer: the token goes to the
+ * investigator and the card leaves the square. An Item is taken into the hand,
+ * and an Event is read out and played. A Monster is the card itself, so it stays
+ * where it was read; that deck is not in the game yet.
+ */
+function collectEncounter(state, ctx, key) {
+  const marker = state.encounters[key];
+  if (!marker || !marker.type || marker.collected) return null;
+
+  const player = currentPlayer(state);
+  // Taking the card up spends it: the encounter card leaves the table for the
+  // discard pile along with the square it was lying on.
+  const setAside = () => {
+    if (marker.cardId) state.encounterDiscard.push(marker.cardId);
+    delete state.encounters[key];
+  };
+
+  if (marker.type === 'clue') {
+    player.clues = (player.clues ?? 0) + 1;
+    pushLog(state, 'That is one clue to the good, and the card is taken away.');
+    setAside();
+    return 'clue';
+  }
+
+  if (marker.type === 'nothing') {
+    pushLog(state, 'The card is taken away and nothing follows.');
+    setAside();
+    return 'nothing';
+  }
+
+  if (marker.type === 'item') {
+    if (!marker.itemId) {
+      pushLog(state, 'There is no item lying under the card to take.');
+    } else {
+      player.items ??= [];
+      player.items.push(marker.itemId);
+      const item = ctx.items?.[marker.itemId];
+      pushLog(
+        state,
+        `The card is an item — ${item ? item.name : marker.itemId}, kept until it is needed.`,
+      );
+    }
+    setAside();
+    return 'item';
+  }
+
+  if (marker.type === 'event') {
+    const eventId = drawFrom(state, 'eventDeck', 'eventDiscard', 'event');
+    if (eventId === null) {
+      pushLog(state, 'The event deck is spent and empty, so nothing follows.');
+      return null;
+    }
+    const event = ctx.events?.[eventId];
+    if (!event) throw new Error(`unknown event card "${eventId}"`);
+    state.eventDiscard.push(eventId);
+    setAside();
+    pushLog(state, `The event is read out — ${event.text}`);
+    if (event.needs.length > 0) {
+      const words = event.needs.map((need) => NEED_WORD[need]);
+      pushLog(
+        state,
+        `That card is still pending: it needs ${words.join(' and ')}, which the game does not have yet, so nothing happens this time.`,
+      );
+    } else {
+      playEvent(state, ctx, event, player);
+    }
+    return 'event';
+  }
+
+  // A monster is the card itself: it stays where it was read, and there is
+  // nothing further to take from the square.
+  marker.collected = true;
+  pushLog(
+    state,
+    'It is a Monster. That deck is not in the game yet, so the card stays where it is.',
+  );
+  return 'monster';
+}
+
+function playersInRoom(state, slot) {
+  return state.players.filter((p) => {
+    const at = slotOf(p.pos);
+    return at.R === slot.R && at.C === slot.C;
+  });
+}
+
+function flipForSecondPlayer(state, ctx, slot) {
+  if (playersInRoom(state, slot).length < 2) return;
+  for (const [key, marker] of Object.entries(state.encounters)) {
+    if (marker.room !== roomKey(slot.R, slot.C)) continue;
+    if (marker.flip !== 'second-player') continue;
+    turnUp(state, ctx, key, 'a second investigator has come in');
+  }
+}
+
+/**
+ * The general reveal: stopping on an encounter card, or on the square next to
+ * it, brings it into the light.
+ *
+ * How wide that ring is belongs to the scenario, because it is the kind of thing
+ * a late draft changes: "none" leaves every card face down until something else
+ * turns it, "on" only counts the square you are standing on, "adjacent" only
+ * the squares around you, and "on-or-adjacent" both.
+ *
+ * Adjacency is judged inside the room. A card on the other side of a wall is not
+ * next to anything, however close the squares are on the table.
+ */
+function revealAtEndOfTurn(state, ctx, player) {
+  const mode = state.encounterReveal ?? 'none';
+
+  const slot = slotOf(player.pos);
+  const here = { pos: player.pos, where: 'there' };
+  const beside = [];
+  for (const dir of DIRS) {
+    const at = { gr: player.pos.gr + dir.dr, gc: player.pos.gc + dir.dc };
+    const there = slotOf(at);
+    if (there.R !== slot.R || there.C !== slot.C) continue;
+    beside.push({ pos: at, where: 'beside it' });
+  }
+
+  const house =
+    mode === 'none'
+      ? []
+      : mode === 'on'
+        ? [here]
+        : mode === 'adjacent'
+          ? beside
+          : [here, ...beside];
+
+  const turned = new Set();
+  for (const { pos, where } of house) {
+    const marker = state.encounters[posKey(pos)];
+    if (!marker || marker.faceUp) continue;
+    turned.add(posKey(pos));
+    turnUp(state, ctx, posKey(pos), `${player.name} ended their turn ${where}`);
+  }
+
+  // "Flip it if a player ends their turn next to it" is printed on the card, so
+  // it happens whether or not the scenario turns cards over on its own.
+  for (const { pos, where } of beside) {
+    const key = posKey(pos);
+    const marker = state.encounters[key];
+    if (!marker || marker.faceUp || turned.has(key)) continue;
+    if (marker.flip !== 'end-turn-adjacent') continue;
+    turnUp(state, ctx, key, `${player.name} ended their turn ${where}`);
+  }
+}
+
+function flipAtRoundEnd(state, ctx, endingRound) {
+  for (const [key, marker] of Object.entries(state.encounters)) {
+    if (marker.flip !== 'end-of-next-round') continue;
+    if (marker.flipRound === null || marker.flipRound > endingRound) continue;
+    turnUp(state, ctx, key, 'the round has ended');
+  }
+}
+
+/** The cards on the floor of a room that is turning turn with it. */
+function rotateEncounterCards(state, slot) {
+  const here = roomKey(slot.R, slot.C);
+  for (const [key, marker] of Object.entries(state.encounters)) {
+    if (marker.room !== here) continue;
+    const [gr, gc] = key.split(',').map(Number);
+    const local = localOf({ gr, gc });
+    const to = posOf(slot.R, slot.C, local.c, ROOM_SIZE - 1 - local.r);
+    const toKey = posKey(to);
+    // If the square it would land on is occupied there is nowhere for it to go,
+    // so it stays where it is rather than pushing the other card off the table.
+    if (toKey === key || state.encounters[toKey]) continue;
+    delete state.encounters[key];
+    marker.number = numberOfPos(to);
+    state.encounters[toKey] = marker;
+  }
+}
+
+/**
+ * The room's entrance card, applied every time a room is entered — the first
+ * time and every time after that.
+ *
+ * `entry` is the square the investigator stepped onto, which is the square just
+ * inside the doorway they came through. "Nearest" and "farthest" are both
+ * measured from it.
+ */
+function resolveEntrance(state, ctx, slot, entry) {
+  state.lastEntrance = null;
+  if (!ctx.entrances) return;
+
+  const id = drawEntrance(state);
+  if (!id) return;
+  const card = ctx.entrances[id];
+  if (!card) throw new Error(`unknown room entrance card "${id}"`);
+  state.entranceSeen.push(id);
+
+  const here = roomEntryAt(state, slot);
+  const roomName = ctx.rooms[here.roomId].name;
+  pushLog(state, `Room entrance — ${card.text}`);
+
+  const numbers = [];
+  const taken = new Set();
+  for (let i = 0; i < card.draw; i++) {
+    const number = chooseSquare(state, card.placement, slot, entry, taken, i);
+    if (number === null) {
+      pushLog(state, `There is no square left in the ${roomName} for the rest of that.`);
+      break;
+    }
+    taken.add(number);
+    const laid = placeEncounter(state, ctx, slot, number, card);
+    if (laid === 'placed') {
+      numbers.push(number);
+    } else if (laid === 'occupied') {
+      // A fixed square can already be taken when the room is entered again.
+      pushLog(state, `A card already lies on [${number}] in the ${roomName}.`);
+    } else {
+      pushLog(state, `The encounter deck is spent, so no card can be laid on [${number}].`);
+    }
+  }
+
+  if (numbers.length > 0) {
+    const way = card.face === 'up' ? 'face up' : 'face down';
+    pushLog(
+      state,
+      `${numbers.length} card${numbers.length === 1 ? '' : 's'} ${way} in the ${roomName} on ${listSquares(numbers)}.`,
+    );
+  }
+
+  // A card laid face up is revealed as it lands rather than waiting for someone
+  // to walk over it. A face-down one is turned by an action, a lantern, or one of
+  // the entrance card's own timings.
+  if (card.face === 'up') {
+    for (const number of numbers) revealEncounter(state, ctx, posKey(posOfNumber(slot, number)));
+  }
+
+  // "If Monster, place another face up on [2]." The card is laid face up, so the
+  // encounter deck has already answered for it by the time this runs.
+  if (card.specials.ifMonsterSpace !== null && numbers.length > 0) {
+    const first = state.encounters[posKey(posOfNumber(slot, numbers[0]))];
+    if (first && first.type === 'monster') {
+      const number = card.specials.ifMonsterSpace;
+      if (placeEncounter(state, ctx, slot, number, card) === 'placed') {
+        // It counts as one of the room's cards, so the record of the entrance
+        // includes it and the board can point at it.
+        numbers.push(number);
+        pushLog(state, `It is a monster, so a card lies face up on [${number}].`);
+        // The second card is laid face up too, so it is revealed as it lands.
+        revealEncounter(state, ctx, posKey(posOfNumber(slot, number)));
+      }
+    }
+  }
+
+  if (card.specials.discardOne) {
+    pushLog(state, 'A second card is drawn and put aside unseen.');
+  }
+
+  // "Mark 1 Shift Point" — the house comes one step closer to turning. It is the
+  // same bar the round-end roll uses, so a point does what a quiet round does,
+  // only now rather than at the end of the round. Two points stack.
+  if (card.specials.shiftPoints > 0) markShiftPoint(state, card.specials.shiftPoints);
+
+  // "Player chooses 1 face down encounter card and turns it face up." With the
+  // cards still blank there is nothing to read, so the choice is the first one
+  // lying in this room. A chooser belongs in the UI once cards have faces.
+  if (card.specials.playerChoice) {
+    const key = Object.keys(state.encounters).find(
+      (k) => state.encounters[k].room === roomKey(slot.R, slot.C) && !state.encounters[k].faceUp,
+    );
+    if (key) turnUp(state, ctx, key, 'the investigator chose it');
+    else pushLog(state, 'There is nothing face down in this room to turn over.');
+  }
+
+  state.lastEntrance = {
+    id,
+    slot: roomKey(slot.R, slot.C),
+    entry: { ...entry },
+    numbers,
+    placed: numbers.map((n) => posKey(posOfNumber(slot, n))),
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * Replay
+ * ------------------------------------------------------------------ */
+
+/** Rebuild a game from its seed and action list. */
+export function replay(ctx, options, actions) {
+  let state = createGame(ctx, options);
+  for (const action of actions) state = reduce(state, action, ctx);
+  return state;
+}
+
+/** The portable record of a game: everything needed to reproduce it. */
+export function exportReplay(state, actions) {
+  return {
+    scenarioId: state.scenarioId,
+    seed: state.seed,
+    playerNames: state.players.map((p) => p.name),
+    actions,
+  };
+}

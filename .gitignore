@@ -1,0 +1,14 @@
+# dependencies, if any are ever added
+node_modules/
+
+# logs and local preview output
+*.log
+
+# secrets never belong in the repo; cards and rules do
+.env
+.env.*
+!.env.example
+
+# editor / OS clutter
+.DS_Store
+Thumbs.db

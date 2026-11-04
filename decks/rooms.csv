@@ -1,0 +1,21 @@
+id,name,n,e,s,w,text
+foyer,Foyer,1,1,1,1,"Starting room. Never rotates."
+library-of-azrel,Library of Azrel,1,1,1,1,"Special: spend 1 Clue to regain 1 Sanity."
+rift-room,Rift Room,1,1,1,1,"Story-driven. Enters play last."
+study,Study,1,1,0,0,
+conservatory,Conservatory,0,1,1,1,
+gallery,Gallery,1,0,1,0,
+sitting-room,Sitting Room,1,0,0,1,
+dining-hall,Dining Hall,0,1,1,0,
+pantry,Pantry,1,0,1,1,
+kitchen,Kitchen,1,1,1,0,
+cellar,Cellar,0,0,1,1,
+servants-quarters,Servants' Quarters,1,1,0,0,
+loft,Loft,1,0,1,0,
+vault,Vault,0,1,0,1,
+chapel,Chapel,0,1,1,1,
+parlor,Parlor,1,1,0,1,
+armory,Armory,1,0,1,1,
+washroom,Washroom,0,1,1,0,
+guest-room,Guest Room,1,0,0,1,
+observatory,Observatory,1,1,1,0,

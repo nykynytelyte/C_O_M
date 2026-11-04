@@ -1,0 +1,346 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Print &amp; Play Kit — Card Sheet Builder</title>
+<style>
+  /* ---------- page / sheet geometry (all print sizes in mm) ---------- */
+  :root{
+    --pw: 210mm;  --ph: 297mm;      /* sheet size */
+    --cw: 63mm;   --ch: 88mm;       /* card trim size (standard poker) */
+    --cols: 3;    --rows: 3;
+    --gutter: 4mm;                  /* white space between trims */
+    --bleed: 2mm;                   /* art extends past the trim */
+    --ink: #14161a;
+  }
+
+  *{ box-sizing: border-box; }
+  html, body{ margin: 0; }
+
+  body{
+    background: #0f1115;
+    color: #e8eaef;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    padding-bottom: 4rem;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  /* ---------- toolbar (never prints) ---------- */
+  .bar{
+    position: sticky; top: 0; z-index: 20;
+    display: flex; align-items: center; gap: .6rem; flex-wrap: wrap;
+    padding: .7rem 1rem;
+    background: #151922;
+    border-bottom: 1px solid #232936;
+  }
+  .bar h1{ font-size: 13.5px; font-weight: 600; margin: 0; letter-spacing: .01em; }
+  .bar .sp{ flex: 1 1 auto; }
+  button{
+    font: inherit; font-size: 13px; color: #e8eaef;
+    background: #222a37; border: 1px solid #313b4d; border-radius: 8px;
+    padding: .4rem .7rem; cursor: pointer;
+  }
+  button:hover{ background: #2a3444; }
+  button[aria-pressed="false"]{ opacity: .55; }
+  button.primary{ background: #3b82f6; border-color: #3b82f6; color: #fff; }
+  button.primary:hover{ background: #2f74e0; }
+  .hint{
+    padding: .55rem 1rem; margin: 0;
+    font-size: 12px; line-height: 1.5; color: #93a0b5;
+    background: #11151c; border-bottom: 1px solid #1b212c;
+  }
+  .hint code{ color: #cfd6e2; }
+
+  /* ---------- sheets ---------- */
+  #sheets{ display: flex; flex-direction: column; align-items: center; gap: 22px; padding: 22px 0; }
+
+  .sheet{
+    position: relative; isolation: isolate; overflow: hidden;
+    width: var(--pw); height: calc(var(--ph) - 0.3mm);
+    background: #fff;
+    padding: calc((var(--ph) - var(--rows) * var(--ch) - (var(--rows) - 1) * var(--gutter)) / 2)
+             calc((var(--pw) - var(--cols) * var(--cw) - (var(--cols) - 1) * var(--gutter)) / 2);
+    display: grid;
+    grid-template-columns: repeat(var(--cols), var(--cw));
+    grid-template-rows: repeat(var(--rows), var(--ch));
+    gap: var(--gutter);
+    box-shadow: 0 10px 30px rgba(0,0,0,.45);
+  }
+
+  /* ---------- card ---------- */
+  .card{
+    position: relative;
+    width: var(--cw); height: var(--ch);
+    background: var(--bg, #2b3340);
+    border-radius: 2mm;
+  }
+  /* bleed: same art colour extended past the trim line */
+  .card::before{
+    content: ""; position: absolute; inset: calc(-1 * var(--bleed));
+    background: var(--bg, #2b3340);
+    border-radius: calc(2mm + var(--bleed));
+    z-index: -1;
+  }
+
+  .face{
+    position: absolute; inset: 0;
+    padding: 3.2mm;
+    display: flex; flex-direction: column; gap: 2mm;
+    color: var(--ink);
+    overflow: hidden;
+  }
+
+  .head{ display: flex; align-items: flex-start; gap: 1.5mm; }
+  .name{
+    flex: 1 1 auto;
+    font-size: 3.7mm; font-weight: 700; line-height: 1.15;
+    letter-spacing: -.01em;
+    color: #fff;
+    text-shadow: 0 0.2mm 0 rgba(0,0,0,.25);
+  }
+  .cost{
+    flex: 0 0 auto;
+    width: 7mm; height: 7mm; border-radius: 50%;
+    display: grid; place-items: center;
+    background: #fff; color: var(--bg, #2b3340);
+    font-size: 3.4mm; font-weight: 700;
+  }
+
+  .art{
+    flex: 1 1 auto;
+    background: var(--tint, #eee);
+    border-radius: 1.4mm;
+    display: grid; place-items: center;
+  }
+  .art span{
+    font-size: 22mm; font-weight: 800; line-height: 1;
+    color: var(--bg, #2b3340); opacity: .2;
+  }
+
+  .text{
+    background: #fff; border-radius: 1.4mm;
+    padding: 2mm 2.2mm;
+    font-size: 2.85mm; line-height: 1.35;
+  }
+
+  .foot{
+    display: flex; justify-content: space-between; align-items: baseline;
+    font-size: 2.3mm; letter-spacing: .06em; text-transform: uppercase;
+    color: #fff; opacity: .85;
+  }
+
+  /* ---------- card back ---------- */
+  .card.back .face{ padding: 0; }
+  .backmark{
+    flex: 1 1 auto;
+    display: grid; place-items: center; align-content: center; gap: 1.5mm;
+    border-radius: 1.6mm;
+    border: 0.4mm solid #fff;
+    margin: 5mm;
+    color: #fff;
+    text-align: center;
+  }
+  .backmark .em{ font-size: 10mm; font-weight: 800; line-height: 1; opacity: .95; }
+  .backmark small{ font-size: 2.3mm; letter-spacing: .18em; text-transform: uppercase; opacity: .8; }
+
+  /* ---------- trim guides ---------- */
+  .show-guides .card{ outline: 0.15mm dashed rgba(220, 38, 38, .6); outline-offset: 0; }
+
+  /* ---------- print ---------- */
+  @page{ size: A4; margin: 0; }
+
+  @media print{
+    body{ background: #fff; padding: 0; }
+    .no-print{ display: none !important; }
+    #sheets{ display: block; padding: 0; }
+    .sheet{
+      box-shadow: none;
+      break-after: page;
+      page-break-after: always;
+    }
+    .sheet:last-child{ break-after: auto; page-break-after: auto; }
+  }
+</style>
+</head>
+<body>
+
+<header class="bar no-print">
+  <h1>Print &amp; Play Kit</h1>
+  <span class="sp"></span>
+  <button id="btn-page">Page: A4</button>
+  <button id="btn-guides" aria-pressed="true">Cut guides</button>
+  <button id="btn-backs" aria-pressed="true">Card backs</button>
+  <button id="btn-print" class="primary">Print kit</button>
+</header>
+
+<p class="hint no-print">
+  Everything below is laid out at true print size. Edit the <code>KIT.cards</code> list at the top of the
+  <code>&lt;script&gt;</code> to swap in your own game. Print at <strong>100% / actual size</strong>, turn off
+  “fit to page”, and for two-sided printing choose <strong>flip on long edge</strong> so sheet N+1 lines up with sheet N.
+</p>
+
+<main id="sheets"></main>
+
+<script>
+/* =========================================================================
+   EDIT EVERYTHING HERE
+   The cards array is the whole game's content. Add, remove, or reorder freely
+   — the sheets paginate themselves.
+   ========================================================================= */
+const KIT = {
+  title: "Untitled Print & Play",
+
+  cards: [
+    { name: "Lantern",   cost: 2, type: "Item",     hull: 30,  text: "Reveal one facedown card in play." },
+    { name: "Rope",      cost: 1, type: "Item",     hull: 20,  text: "Reroll one die. Keep the second result." },
+    { name: "Compass",   cost: 2, type: "Item",     hull: 200, text: "Look at the top three cards. Put them back in any order." },
+    { name: "Ember",     cost: 1, type: "Spell",    hull: 8,   text: "Deal 2 damage to an adjacent unit." },
+    { name: "Map",       cost: 1, type: "Item",     hull: 140, text: "Search your deck for one location card." },
+    { name: "Charm",     cost: 2, type: "Spell",    hull: 280, text: "The next attack against you is cancelled." },
+    { name: "Coin",      cost: 0, type: "Resource", hull: 45,  text: "Gain 1 gold at the start of your turn." },
+    { name: "Boots",     cost: 1, type: "Item",     hull: 100, text: "Move up to 3 spaces this turn." },
+    { name: "Tonic",     cost: 2, type: "Item",     hull: 340, text: "Restore 3 health to any unit." }
+  ]
+};
+
+/* A4 holds 9 cards (3x3) with a 4mm gutter and 2mm bleed.
+   Letter is a touch shorter, so it uses a tighter gutter to stay inside
+   the printer's non-printable margin. */
+const PAGES = {
+  A4:     { pw: 210,   ph: 297,   cols: 3, rows: 3, gutter: 4, bleed: 2 },
+  Letter: { pw: 215.9, ph: 279.4, cols: 3, rows: 3, gutter: 2, bleed: 1 }
+};
+
+const CARD = { w: 63, h: 88 };
+
+const state = {
+  page: "A4",
+  guides: true,
+  backs: true
+};
+
+const $sheets = document.getElementById("sheets");
+
+function applyGeometry(pageName) {
+  const p = PAGES[pageName];
+  const s = document.documentElement.style;
+  s.setProperty("--pw", p.pw + "mm");
+  s.setProperty("--ph", p.ph + "mm");
+  s.setProperty("--cw", CARD.w + "mm");
+  s.setProperty("--ch", CARD.h + "mm");
+  s.setProperty("--cols", p.cols);
+  s.setProperty("--rows", p.rows);
+  s.setProperty("--gutter", p.gutter + "mm");
+  s.setProperty("--bleed", p.bleed + "mm");
+
+  // keep the @page rule in step with the chosen sheet
+  let tag = document.getElementById("page-rule");
+  if (!tag) {
+    tag = document.createElement("style");
+    tag.id = "page-rule";
+    document.head.appendChild(tag);
+  }
+  tag.textContent = `@page{ size: ${p.pw}mm ${p.ph}mm; margin: 0; }`;
+}
+
+function bg(hull) { return `hsl(${hull} 42% 30%)`; }
+function tint(hull) { return `hsl(${hull} 46% 92%)`; }
+
+function cardHTML(card) {
+  const initial = (card.name || "?").trim().charAt(0).toUpperCase();
+  return `
+    <div class="card" style="--bg:${bg(card.hull)};--tint:${tint(card.hull)}">
+      <div class="face">
+        <div class="head">
+          <div class="name">${esc(card.name)}</div>
+          ${card.cost === undefined || card.cost === null ? "" : `<div class="cost">${esc(String(card.cost))}</div>`}
+        </div>
+        <div class="art"><span>${esc(initial)}</span></div>
+        <div class="text">${esc(card.text)}</div>
+        <div class="foot"><span>${esc(card.type || "")}</span><span>${esc(KIT.title)}</span></div>
+      </div>
+    </div>`;
+}
+
+function backHTML() {
+  const hull = 215;
+  return `
+    <div class="card back" style="--bg:${bg(hull)};--tint:${tint(hull)}">
+      <div class="face">
+        <div class="backmark">
+          <div class="em">P&amp;P</div>
+          <small>${esc(KIT.title)}</small>
+        </div>
+      </div>
+    </div>`;
+}
+
+function esc(str) {
+  return String(str ?? "")
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function buildSheet(slots) {
+  const sheet = document.createElement("section");
+  sheet.className = "sheet" + (state.guides ? " show-guides" : "");
+  sheet.innerHTML = slots.join("");
+  return sheet;
+}
+
+function render() {
+  const p = PAGES[state.page];
+  const per = p.cols * p.rows;
+
+  applyGeometry(state.page);
+  $sheets.innerHTML = "";
+
+  for (let start = 0; start < KIT.cards.length; start += per) {
+    const chunk = KIT.cards.slice(start, start + per);
+
+    // front sheet: cards in reading order
+    const fronts = chunk.map(cardHTML);
+    for (let i = chunk.length; i < per; i++) fronts.push(""); // empty slots
+    $sheets.appendChild(buildSheet(fronts));
+
+    // back sheet: mirrors the columns so long-edge duplex lines up
+    if (state.backs) {
+      const slots = new Array(per).fill("");
+      chunk.forEach((_, i) => {
+        const row = Math.floor(i / p.cols);
+        const col = i % p.cols;
+        const mirrored = row * p.cols + (p.cols - 1 - col);
+        slots[mirrored] = backHTML();
+      });
+      $sheets.appendChild(buildSheet(slots));
+    }
+  }
+}
+
+/* ---------- toolbar ---------- */
+document.getElementById("btn-page").addEventListener("click", (e) => {
+  state.page = state.page === "A4" ? "Letter" : "A4";
+  e.currentTarget.textContent = "Page: " + state.page;
+  render();
+});
+
+document.getElementById("btn-guides").addEventListener("click", (e) => {
+  state.guides = !state.guides;
+  e.currentTarget.setAttribute("aria-pressed", String(state.guides));
+  render();
+});
+
+document.getElementById("btn-backs").addEventListener("click", (e) => {
+  state.backs = !state.backs;
+  e.currentTarget.setAttribute("aria-pressed", String(state.backs));
+  render();
+});
+
+document.getElementById("btn-print").addEventListener("click", () => window.print());
+
+render();
+</script>
+</body>
+</html>

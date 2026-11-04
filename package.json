@@ -1,0 +1,10 @@
+{
+  "name": "corridors-of-madness",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Digital table for Corridors of Madness.",
+  "scripts": {
+    "test": "node test/engine.test.mjs && node test/investigators.test.mjs"
+  }
+}
