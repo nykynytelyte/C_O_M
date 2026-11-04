@@ -1,5 +1,5 @@
 id,name,n,e,s,w,text,special
-foyer,Foyer,1,1,1,1,"Starting room. Never rotates.",
+foyer,Foyer,1,1,1,1,"Starting room. Never rotates. Special: spend 1 Clue to regain 1 Health.",clue-for-health
 library-of-azrel,Library of Azrel,1,1,1,1,"Special: spend 1 Clue to regain 1 Sanity.",clue-for-sanity
 rift-room,Rift Room,1,1,1,1,"Story-driven. Enters play last.",
 study,Study,1,1,0,0,,

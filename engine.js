@@ -173,9 +173,11 @@ function parseEdgeDoors(value, id, dir) {
  * these in its `special` column; standing in the room, it costs an action.
  *
  *   clue-for-sanity   spend 1 Clue to regain 1 Sanity (the Library of Azrel)
+ *   clue-for-health   spend 1 Clue to regain 1 Health (the Foyer)
  */
 const ROOM_SPECIALS = {
-  'clue-for-sanity': { label: 'Spend 1 Clue to regain 1 Sanity' },
+  'clue-for-sanity': { label: 'Spend 1 Clue to regain 1 Sanity', pool: 'sanity' },
+  'clue-for-health': { label: 'Spend 1 Clue to regain 1 Health', pool: 'health' },
 };
 
 export function roomsFromCsv(text) {
@@ -2621,26 +2623,23 @@ export function roomSpecialProblem(state, ctx) {
   const player = currentPlayer(state);
   if (engagedWith(state, player).length > 0) return 'you are engaged with a monster — Attack or Flee first';
 
-  if (here.room.special === 'clue-for-sanity') {
-    if ((player.clues ?? 0) < 1) return `${player.name} has no Clue to spend`;
-    if (typeof player.sanity !== 'number') return `${player.name} has no Sanity on their sheet`;
-    if (player.sanity >= player.sanityMax) return `${player.name} is already at full Sanity`;
-  }
+  const pool = here.pool;
+  const word = pool === 'sanity' ? 'Sanity' : 'Health';
+  if ((player.clues ?? 0) < 1) return `${player.name} has no Clue to spend`;
+  if (typeof player[pool] !== 'number') return `${player.name} has no ${word} on their sheet`;
+  if (player[pool] >= player[`${pool}Max`]) return `${player.name} is already at full ${word}`;
   return null;
 }
 
 function doRoomSpecial(state, ctx) {
   const problem = roomSpecialProblem(state, ctx);
   if (problem) throw new Error(problem);
-  const { room } = roomSpecialHere(state, ctx);
+  const { room, pool } = roomSpecialHere(state, ctx);
   const player = currentPlayer(state);
   state.actionsLeft -= 1;
-
-  if (room.special === 'clue-for-sanity') {
-    player.clues -= 1;
-    pushLog(state, `${player.name} spends a Clue in the ${room.name}.`);
-    changePool(state, player, 'sanity', 1, `the ${room.name}`);
-  }
+  player.clues -= 1;
+  pushLog(state, `${player.name} spends a Clue in the ${room.name}.`);
+  changePool(state, player, pool, 1, `the ${room.name}`);
   return state;
 }
 

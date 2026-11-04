@@ -462,7 +462,8 @@ const ctx = { scenario, rooms, entrances, encounterCards, items, events, investi
 {
   const rooms = ctx.rooms;
   assert.equal(rooms['library-of-azrel'].special, 'clue-for-sanity');
-  assert.equal(rooms.foyer.special, null, 'an ordinary room has no special');
+  assert.equal(rooms.foyer.special, 'clue-for-health', 'the Foyer mends the body');
+  assert.equal(rooms.kitchen.special, null, 'an ordinary room has no special');
   assert.throws(
     () => roomsFromCsv('id,name,n,e,s,w,text,special\nx,X,1,1,1,1,,fly'),
     /not one of/,
@@ -472,7 +473,18 @@ const ctx = { scenario, rooms, entrances, encounterCards, items, events, investi
   const me = game.players[0];
   me.clues = 2;
   me.sanity = 3;
-  assert.match(roomSpecialProblem(game, ctx), /nothing special/, 'not in the Foyer');
+  // The Foyer: the same trade, for Health.
+  assert.match(roomSpecialProblem(game, ctx), /full Health/, 'no Clue is wasted at full Health');
+  me.health = 2;
+  const mended = reduce(game, { type: 'ROOM_SPECIAL' }, ctx);
+  assert.equal(mended.players[0].clues, 1, 'a Clue is spent in the Foyer');
+  assert.equal(mended.players[0].health, 3, 'and a point of Health regained');
+  assert.equal(mended.players[0].sanity, 3, 'but no Sanity');
+  assert.equal(mended.actionsLeft, game.actionsLeft - 1, 'it takes an action');
+
+  game.rooms['1,0'] = { roomId: 'kitchen', rot: 0 };
+  me.pos = { gr: 4, gc: 1 };
+  assert.match(roomSpecialProblem(game, ctx), /nothing special/, 'not in the Kitchen');
 
   game.rooms['0,1'] = { roomId: 'library-of-azrel', rot: 0 };
   me.pos = { gr: 1, gc: 4 };
