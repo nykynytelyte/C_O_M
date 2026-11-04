@@ -340,6 +340,23 @@ function parseMonsterPower(value, id) {
  * Expected columns: id, name, health, and — if the deck has them — ability,
  * power, text, flavor.
  */
+/**
+ * How monsters move at the end of each round, when their card does not say:
+ *   none    they stay where they appeared
+ *   hunt    1 space toward the nearest investigator, through doors
+ *   room    1 space toward the nearest investigator in their own room
+ * A monster card's own `movement` column overrides the rule for that monster.
+ */
+const MOVEMENTS = ['none', 'hunt', 'room'];
+
+function readMovement(value, what) {
+  if (!value) return null;
+  if (!MOVEMENTS.includes(value)) {
+    throw new Error(`${what} moves "${value}", which is not one of ${MOVEMENTS.join(', ')}`);
+  }
+  return value;
+}
+
 export function monstersFromCsv(text) {
   const [header, ...rows] = parseCsv(text);
   if (!header) throw new Error('monster CSV is empty');
@@ -355,6 +372,8 @@ export function monstersFromCsv(text) {
   const iPower = column('power', false);
   const iText = column('text', false);
   const iFlavor = column('flavor', false);
+  const iMovement = column('movement', false);
+  const iDamage = column('damage', false);
   const cell = (row, index) => (index === -1 ? '' : (row[index] ?? '').trim());
 
   const cards = {};
@@ -376,7 +395,12 @@ export function monstersFromCsv(text) {
       power: parseMonsterPower(cell(row, iPower), id),
       text: cell(row, iText),
       flavor: cell(row, iFlavor),
+      movement: readMovement(cell(row, iMovement), `monster "${id}"`),
+      damage: cell(row, iDamage) === '' ? undefined : Number(cell(row, iDamage)),
     };
+    if (cards[id].damage !== undefined && !Number.isInteger(cards[id].damage)) {
+      throw new Error(`monster "${id}" deals "${cell(row, iDamage)}" damage, which is not a number`);
+    }
   }
   if (Object.keys(cards).length === 0) throw new Error('monster CSV has no monsters');
   return cards;
@@ -2215,6 +2239,8 @@ function spawnMonster(state, ctx, pos, why) {
     name: card.name,
     health: card.health,
     power: card.power,
+    movement: card.movement ?? null,
+    damage: card.damage ?? undefined,
     pos: { ...pos },
   });
   pushLog(
@@ -2298,6 +2324,35 @@ function moveMonstersTowardPlayers(state, ctx, spaces) {
         : `${theName(monster.name, true)} moves toward ${target.name}.`,
     );
   }
+}
+
+/** The end of a round: every monster that moves takes its step. */
+function monstersAtRoundEnd(state, ctx) {
+  const fallback = ctx.scenario.monsterMovement ?? 'none';
+  for (const monster of state.monsters ?? []) {
+    if (monster.kind === 'boss') continue;
+    const mode = monster.movement ?? fallback;
+    if (mode === 'none') continue;
+    const here = slotOf(monster.pos);
+    const prey = onTable(state).filter((p) => {
+      if (mode !== 'room') return true;
+      const at = slotOf(p.pos);
+      return at.R === here.R && at.C === here.C;
+    });
+    if (prey.length === 0) continue;
+    const target = prey.reduce((best, p) =>
+      gapOf(p.pos, monster.pos) < gapOf(best.pos, monster.pos) ? p : best,
+    );
+    // It closes in, but does not step onto an investigator: beside them is enough.
+    if (gapOf(target.pos, monster.pos) <= 1) continue;
+    if (drawToward(state, ctx, monster, target.pos, 1) > 0) {
+      pushLog(state, `${theName(monster.name, true)} moves toward ${target.name}.`);
+    }
+  }
+}
+
+function gapOf(a, b) {
+  return Math.abs(a.gr - b.gr) + Math.abs(a.gc - b.gc);
 }
 
 function nearestPlayer(state, pos, diagonal) {
@@ -2455,8 +2510,35 @@ function doCombat(state, ctx, kind, monsterId) {
 
 function resolveCombat(state, ctx, player, monster, kind) {
   state.actionsLeft -= 1;
-  const value = rollD6(state, kind === 'attack' ? 'an attack' : 'a flight');
+  let value = rollD6(state, kind === 'attack' ? 'an attack' : 'a flight');
 
+  // Steel Nerves: a failed Flee is rolled again for free, once a turn.
+  if (kind === 'flee' && value < 4 && player.ability === 'steel-nerves' && !player.fledReroll) {
+    player.fledReroll = true;
+    pushLog(state, `${player.name} rolls ${value} and steadies (Steel Nerves) — rolling again.`);
+    value = rollD6(state, 'a flight');
+  }
+
+  // "Spend 1 Clue to reroll any 1d6 roll." Offered when it would matter.
+  if (value < 4 && combatRules(ctx).clueReroll && (player.clues ?? 0) > 0) {
+    pushLog(state, `${player.name} rolls ${value}.`);
+    beginChoice(state, {
+      kind: 'reroll',
+      playerId: player.id,
+      prompt: `${player.name} rolled ${value} — spend 1 Clue to roll again?`,
+      options: [
+        { id: 'yes', label: `Spend 1 Clue (${player.clues} held) and reroll` },
+        { id: 'no', label: `Keep the ${value}` },
+      ],
+      combat: { kind, monsterId: monster.id, value },
+    });
+    return;
+  }
+  settleCombat(state, ctx, player, monster, kind, value);
+}
+
+/** What a combat roll does, once the die is final. */
+function settleCombat(state, ctx, player, monster, kind, value) {
   if (kind === 'attack') {
     engage(state, player, monster);
     if (value >= 4) {
@@ -2464,24 +2546,34 @@ function resolveCombat(state, ctx, player, monster, kind) {
       strikeMonster(state, ctx, monster, { hit: { damage: ATTACK_DAMAGE, reach: 1 } }, 'blow');
     } else {
       pushLog(state, `${player.name} attacks ${theName(monster.name)}: ${value} — a miss.`);
-      monsterHits(state, monster, player, COMBAT_DAMAGE);
+      monsterHits(state, monster, player, monsterDamage(ctx, monster));
     }
     return;
   }
 
-  let flight = value;
-  if (flight < 4 && player.ability === 'steel-nerves' && !player.fledReroll) {
-    player.fledReroll = true;
-    pushLog(state, `${player.name} rolls ${flight} and steadies (Steel Nerves) — rolling again.`);
-    flight = rollD6(state, 'a flight');
-  }
-  if (flight >= 4) {
+  if (value >= 4) {
     disengage(player, monster);
-    pushLog(state, `${player.name} flees ${theName(monster.name)}: ${flight} — free.`);
+    pushLog(state, `${player.name} flees ${theName(monster.name)}: ${value} — free.`);
   } else {
-    pushLog(state, `${player.name} tries to flee ${theName(monster.name)}: ${flight} — caught.`);
-    monsterHits(state, monster, player, COMBAT_DAMAGE);
+    pushLog(state, `${player.name} tries to flee ${theName(monster.name)}: ${value} — caught.`);
+    monsterHits(state, monster, player, monsterDamage(ctx, monster));
   }
+}
+
+/**
+ * The core combat rules, with their defaults:
+ *   clueReroll     spend 1 Clue to reroll a failed Attack or Flee
+ *   monsterDamage  what a monster's blow deals, unless its card says otherwise
+ *   bossDamage     what the boss's blow deals, unless its card says otherwise
+ */
+function combatRules(ctx) {
+  return { clueReroll: false, monsterDamage: 1, bossDamage: 1, ...(ctx.scenario.combat ?? {}) };
+}
+
+function monsterDamage(ctx, monster) {
+  if (Number.isInteger(monster.damage)) return monster.damage;
+  const rules = combatRules(ctx);
+  return monster.kind === 'boss' ? rules.bossDamage : rules.monsterDamage;
 }
 
 /** Binding Chalk: this monster cannot engage the investigator this turn. */
@@ -2547,6 +2639,7 @@ function checkSummoning(state, ctx) {
     name: boss.name,
     health: boss.health,
     movement: boss.movement ?? 1,
+    damage: Number.isInteger(boss.damage) ? boss.damage : undefined,
     ignoresWalls: Boolean(boss.ignoresWalls),
     diagonal: Boolean(boss.diagonal),
     aura: boss.aura ?? null,
@@ -3159,6 +3252,19 @@ function resolveChoice(state, ctx, choice, picked) {
   const chooser = state.players.find((player) => player.id === choice.playerId);
   if (!chooser) throw new Error('the choice names an investigator who is not at the table');
 
+  if (choice.kind === 'reroll') {
+    const { kind, monsterId, value } = choice.combat;
+    const monster = (state.monsters ?? []).find((m) => m.id === monsterId);
+    let final = value;
+    if (picked.id === 'yes') {
+      chooser.clues -= 1;
+      final = rollD6(state, kind === 'attack' ? 'an attack' : 'a flight');
+      pushLog(state, `${chooser.name} spends a Clue and rolls again: ${final}.`);
+    }
+    if (monster) settleCombat(state, ctx, chooser, monster, kind, final);
+    return;
+  }
+
   if (choice.kind === 'attack' || choice.kind === 'flee') {
     const target = (state.monsters ?? []).find((m) => m.id === picked.id);
     if (!target) throw new Error('that monster is no longer on the table');
@@ -3564,6 +3670,7 @@ function doEndTurn(state, ctx) {
   // Cards timed to the end of a round go over before the house moves, so the
   // table sees them before the corridors turn.
   flipAtRoundEnd(state, ctx, endingRound);
+  monstersAtRoundEnd(state, ctx);
   bossAtRoundEnd(state, ctx);
   const seated = onTable(state);
   const roller = seated[(endingRound - 1) % seated.length];

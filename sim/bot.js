@@ -150,6 +150,13 @@ function answerChoice(state, ctx) {
     return { type: 'CHOOSE', optionId: monsters[0]?.id ?? options[0].id };
   }
 
+  if (choice.kind === 'reroll') {
+    // Clues are for the seal: spend one on a reroll only when hurting, or rich.
+    const me = state.players.find((p) => p.id === choice.playerId);
+    const worth = low(me, 'health') || low(me, 'sanity') || (me.clues ?? 0) >= 3;
+    return { type: 'CHOOSE', optionId: worth ? 'yes' : 'no' };
+  }
+
   return { type: 'CHOOSE', optionId: options[0].id };
 }
 

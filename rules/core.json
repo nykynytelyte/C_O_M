@@ -41,5 +41,11 @@
     "fromRound": 10,
     "onlyWhenTrapped": false,
     "sanity": 0
-  }
+  },
+  "combat": {
+    "clueReroll": true,
+    "monsterDamage": 1,
+    "bossDamage": 2
+  },
+  "monsterMovement": "none"
 }

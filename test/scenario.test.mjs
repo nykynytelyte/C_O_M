@@ -331,6 +331,72 @@ const riftOpen = (game) => {
 }
 
 /* ------------------------------------------------------------------ *
+ * Rulebook defaults: Clue rerolls, boss damage, monster movement
+ * ------------------------------------------------------------------ */
+{
+  assert.deepEqual(scenario.combat, { clueReroll: true, monsterDamage: 1, bossDamage: 2 });
+
+  // A failed Attack with a Clue in hand: the table is asked.
+  let asked = null;
+  for (let seed = 1; seed <= 40 && !asked; seed++) {
+    const game = start({ seed });
+    card(game, '8', { gr: 1, gc: 2 });
+    game.players[0].clues = 2;
+    const after = reduce(game, { type: 'ATTACK' }, ctx);
+    if (after.choice?.kind === 'reroll') asked = after;
+  }
+  assert.ok(asked, 'a failed roll with a Clue in hand offers a reroll');
+  assert.equal(asked.monsters[0].health, 3, 'nothing is settled while the question is open');
+  const kept = reduce(asked, { type: 'CHOOSE', optionId: 'no' }, ctx);
+  assert.equal(kept.players[0].clues, 2, 'keeping the roll costs nothing');
+  assert.ok(kept.players[0].sanity < asked.players[0].sanity, 'and the miss lands');
+  const again = reduce(asked, { type: 'CHOOSE', optionId: 'yes' }, ctx);
+  assert.equal(again.players[0].clues, 1, 'a reroll costs a Clue');
+  assert.match(again.log.join('\n'), /spends a Clue and rolls again/);
+
+  // No Clue in hand, no question.
+  for (let seed = 1; seed <= 10; seed++) {
+    const game = start({ seed });
+    card(game, '8', { gr: 1, gc: 2 });
+    assert.equal(reduce(game, { type: 'ATTACK' }, ctx).choice, null);
+  }
+
+  // The boss card names no damage, so the rulebook's 2 applies.
+  let bossMiss = null;
+  for (let seed = 1; seed <= 40 && !bossMiss; seed++) {
+    const game = start({ seed });
+    game.monsters.push({ id: 'b1', kind: 'boss', name: 'The Nameless Presence', health: 8, healthMax: 8, pos: { gr: 1, gc: 2 } });
+    const after = reduce(game, { type: 'ATTACK' }, ctx);
+    if (after.lastRoll.value < 4) bossMiss = { before: game, after };
+  }
+  assert.equal(bossMiss.after.players[0].health, bossMiss.before.players[0].health - 2, 'a miss on the boss costs 2');
+
+  // Movement: none by default; 'hunt' closes in through doors; 'room' only in its room.
+  const moving = (mode) => {
+    const game = start();
+    game.players.forEach((p) => {
+      p.pos = { gr: 0, gc: 0 };
+    });
+    card(game, '1', { gr: 2, gc: 2 });
+    const c = { ...ctx, scenario: { ...ctx.scenario, monsterMovement: mode } };
+    let g = reduce(game, { type: 'END_TURN' }, c);
+    g = reduce(g, { type: 'END_TURN' }, c);
+    return g.monsters[0].pos;
+  };
+  assert.deepEqual(moving('none'), { gr: 2, gc: 2 }, 'by default monsters stay put');
+  const hunted = moving('hunt');
+  assert.equal(Math.abs(hunted.gr) + Math.abs(hunted.gc), 3, 'hunting, it closes one space');
+  assert.equal(Math.abs(moving('room').gr) + Math.abs(moving('room').gc), 3, 'in its own room it hunts too');
+  const elsewhere = start();
+  card(elsewhere, '1', { gr: -2, gc: 1 });
+  elsewhere.rooms['-1,0'] = { roomId: 'gallery', rot: 0 };
+  const c = { ...ctx, scenario: { ...ctx.scenario, monsterMovement: 'room' } };
+  let g = reduce(elsewhere, { type: 'END_TURN' }, c);
+  g = reduce(g, { type: 'END_TURN' }, c);
+  assert.deepEqual(g.monsters[0].pos, { gr: -2, gc: 1 }, 'a room guard ignores investigators next door');
+}
+
+/* ------------------------------------------------------------------ *
  * The summoning
  * ------------------------------------------------------------------ */
 {
