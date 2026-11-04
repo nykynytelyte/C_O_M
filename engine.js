@@ -1755,6 +1755,10 @@ export function createGame(ctx, options = {}) {
   const encounterIds = ctx.encounterCards
     ? Object.keys(ctx.encounterCards).sort((a, b) => Number(a) - Number(b))
     : [];
+  // More investigators, more clues to find: the rules may add Clue cards to the
+  // encounter deck for each one at the table.
+  const extraClues = ctx.encounterCards ? (scenario.encounters?.extraCluesPerPlayer ?? 0) * count : 0;
+  for (let i = 1; i <= extraClues; i++) encounterIds.push(`extra-clue-${i}`);
   state.encounterDeck = shuffle(state, encounterIds);
 
   // The item deck is shuffled last for the same reason: a table that brings no
@@ -1781,6 +1785,12 @@ export function createGame(ctx, options = {}) {
     `The Foyer. ${names.length} investigator${names.length === 1 ? '' : 's'} begin here. Seed ${seed}.`,
   );
   return state;
+}
+
+/** An encounter card by id, including the extra Clue cards added at setup. */
+function encounterCardOf(ctx, id) {
+  if (String(id).startsWith('extra-clue-')) return { id, type: 'clue' };
+  return ctx.encounterCards?.[id] ?? null;
 }
 
 function shuffle(state, list) {
@@ -2748,7 +2758,7 @@ function doTrait(state, ctx) {
     player.whisperedRound = state.round;
     // Draws take from the end, so the top of the deck is the last card.
     const id = state.encounterDeck[state.encounterDeck.length - 1];
-    const card = ctx.encounterCards?.[id];
+    const card = encounterCardOf(ctx, id);
     const word = card ? ENCOUNTER_WORD[card.type] : 'card';
     state.peek = { by: player.id, round: state.round, cardId: id, type: card?.type ?? null };
     pushLog(state, `${player.name} listens (${trait.name}): the top Encounter card is ${/^[AEIOU]/.test(word) ? 'an' : 'a'} ${word}.`);
@@ -3819,7 +3829,7 @@ function revealEncounter(state, ctx, key) {
   // stops being hidden.
   if (!marker || marker.faceUp) return null;
 
-  const card = ctx.encounterCards[marker.cardId];
+  const card = encounterCardOf(ctx, marker.cardId);
   if (!card) throw new Error(`unknown encounter card "${marker.cardId}"`);
 
   marker.faceUp = true;

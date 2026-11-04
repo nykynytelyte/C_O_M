@@ -401,11 +401,11 @@ const riftOpen = (game) => {
   assert.equal(half.sealClues, 3, 'clues are spent on the seal');
   assert.equal(half.players[0].clues, 0);
   assert.equal(half.actionsLeft, game.actionsLeft - 1, 'it takes an action');
-  assert.equal(half.over, null, 'two investigators need six');
+  assert.equal(half.over, null, 'two investigators need four');
 
   half.players[0].clues = 5;
   const sealed = reduce(half, { type: 'SEAL' }, ctx);
-  assert.equal(sealed.players[0].clues, 2, 'only what the seal still needs is spent');
+  assert.equal(sealed.players[0].clues, 4, 'only what the seal still needs is spent');
   assert.deepEqual(sealed.over, { result: 'won', reason: 'The Rift is sealed.' });
   assert.throws(() => reduce(sealed, { type: 'END_TURN' }, ctx), /the game is over/);
 }

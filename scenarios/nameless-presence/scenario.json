@@ -20,7 +20,7 @@
   "seal": {
     "room": "rift-room",
     "allRoomsRevealed": true,
-    "cluesPerPlayer": 3
+    "cluesPerPlayer": 2
   },
   "boss": {
     "id": "nameless-presence",
@@ -31,8 +31,18 @@
     "movement": 1,
     "ignoresWalls": true,
     "diagonal": true,
-    "aura": { "name": "Mindquake Aura", "reach": "adjacent", "sanity": -1 },
-    "onSanityLoss": { "name": "Rupture of Self", "die": 6, "min": 1, "max": 2, "sanity": -1 }
+    "aura": {
+      "name": "Mindquake Aura",
+      "reach": "adjacent",
+      "sanity": -1
+    },
+    "onSanityLoss": {
+      "name": "Rupture of Self",
+      "die": 6,
+      "min": 1,
+      "max": 2,
+      "sanity": -1
+    }
   },
   "rules": {}
 }

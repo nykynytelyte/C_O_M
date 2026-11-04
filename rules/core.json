@@ -34,7 +34,8 @@
     ]
   },
   "encounters": {
-    "revealOnEndTurn": "none"
+    "revealOnEndTurn": "none",
+    "extraCluesPerPlayer": 1
   },
   "escape": {
     "fromRound": 10,

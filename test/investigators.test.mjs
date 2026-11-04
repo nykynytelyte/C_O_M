@@ -638,4 +638,32 @@ const ctx = { scenario, rooms, entrances, encounterCards, items, events, investi
   assert.equal(walled.escape, null);
 }
 
+/* ------------------------------------------------------------------ *
+ * One extra Clue card in the encounter deck for each player
+ * ------------------------------------------------------------------ */
+{
+  assert.equal(ctx.scenario.encounters.extraCluesPerPlayer, 1);
+  const printed = Object.keys(ctx.encounterCards).length;
+  for (const players of [1, 3]) {
+    const ids = ['1', '2', '3'].slice(0, players);
+    const game = createGame(ctx, { seed: 3, playerCount: players, investigatorIds: ids });
+    assert.equal(game.encounterDeck.length, printed + players, `${players}: one more card per player`);
+    assert.equal(game.encounterDeck.filter((id) => id.startsWith('extra-clue-')).length, players);
+  }
+
+  // An extra card plays as an ordinary Clue.
+  const game = createGame(ctx, { seed: 3, playerCount: 2, investigatorIds: ['5', '2'] });
+  game.players[0].ability = null;
+  game.entranceDeck = ['17'];
+  game.encounterDeck = ['extra-clue-1'];
+  let out = reduce(game, { type: 'MOVE', path: [{ gr: 0, gc: 1 }] }, ctx);
+  out = reduce(out, { type: 'MOVE', path: [{ gr: -1, gc: 1 }] }, ctx);
+  out = reduce(out, { type: 'PLACE_ROOM', orient: pendingOrientations(out, ctx)[0] }, ctx);
+  const [gr, gc] = out.lastEntrance.placed[0].split(',').map(Number);
+  out.players[0].pos = { gr, gc };
+  out.actionsLeft = 1;
+  out = reduce(out, { type: 'INVESTIGATE' }, ctx);
+  assert.equal(out.players[0].clues, 1, 'an extra card is a Clue like any other');
+}
+
 console.log('INVESTIGATOR SHEETS OK');

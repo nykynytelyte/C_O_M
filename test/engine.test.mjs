@@ -197,7 +197,8 @@ function checkInvariants(state, label) {
     .filter(Boolean);
   assert.equal(
     state.encounterDeck.length + state.encounterDiscard.length + lyingIds.length,
-    TOTAL_ENCOUNTERS,
+    // The printed deck, plus the extra Clue cards the rules add for each player.
+    TOTAL_ENCOUNTERS + (scenario.encounters.extraCluesPerPlayer ?? 0) * state.players.length,
     `${label}: encounter cards were lost or duplicated`,
   );
   assert.equal(
