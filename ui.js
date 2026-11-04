@@ -29,6 +29,8 @@ import {
   monsterCount,
   sealProblem,
   sealTarget,
+  combatProblem,
+  engagedWith,
   useItemProblem,
   doorsAt,
   roomKey,
@@ -74,6 +76,8 @@ async function boot() {
     'diag',
     'story',
     'seal',
+    'attack',
+    'flee',
     'flash',
   ]) {
     el[id] = document.getElementById(id);
@@ -128,6 +132,8 @@ async function boot() {
   el.investigate.addEventListener('click', () => dispatch({ type: 'INVESTIGATE' }));
   el.endturn.addEventListener('click', () => dispatch({ type: 'END_TURN' }));
   el.seal.addEventListener('click', () => dispatch({ type: 'SEAL' }));
+  el.attack.addEventListener('click', () => dispatch({ type: 'ATTACK' }));
+  el.flee.addEventListener('click', () => dispatch({ type: 'FLEE' }));
   el.seal.hidden = !ctx.scenario.seal;
   el.newgame.addEventListener('click', () => newGame(true));
   el.copy.addEventListener('click', copyReplay);
@@ -301,8 +307,21 @@ function renderStatus() {
     el.endturn.disabled = true;
     el.investigate.disabled = true;
     el.seal.disabled = true;
+    el.attack.disabled = true;
+    el.flee.disabled = true;
     return;
   }
+
+  for (const kind of ['attack', 'flee']) {
+    const problem = combatProblem(state, kind);
+    el[kind].disabled = Boolean(problem);
+    el[kind].title =
+      problem ??
+      (kind === 'attack'
+        ? 'Attack a monster on or next to your square. Roll 1d6: 4-6 hits, 1-3 misses and you take 1 damage. Costs one action.'
+        : 'Break away from a monster you are engaged with. Roll 1d6: 4+ escapes, 1-3 fails and you take 1 damage. Costs one action.');
+  }
+  const holding = engagedWith(state, currentPlayer(state));
 
   const boss = (state.monsters ?? []).find((m) => m.kind === 'boss');
   const summon = ctx.scenario.summon;
@@ -324,6 +343,9 @@ function renderStatus() {
     `<span class="stat"><b>Room</b> ${where}</span>` +
     `<span class="stat"><b>Actions</b> ${state.actionsLeft} of ${state.actionsPerTurn}</span>` +
     `<span class="stat"><b>Steps</b> ${steps}</span>` +
+    (holding.length
+      ? `<span class="stat over"><b>Engaged</b> ${holding.map((m) => m.name).join(', ')}</span>`
+      : '') +
     scenarioStats +
     `<span class="stat"><b>Clues</b> ${player.clues ?? 0}${
       player.clueLimit ? ` of ${player.clueLimit}` : ''

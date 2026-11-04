@@ -1428,7 +1428,8 @@ function round(state) {
   assert.deepEqual(items['10'].needs, [], 'the Ritual Knife is a weapon now');
   assert.deepEqual(items['10'].effect.hit, { damage: 2, reach: 1 });
   assert.equal(items['10'].effect.health, -1, 'and it costs a point of Health');
-  assert.deepEqual(items['9'].needs, ['monster'], 'Binding Chalk still waits on engagement rules');
+  assert.deepEqual(items['9'].effect.bind, { reach: 1 }, 'Binding Chalk holds a monster back');
+  assert.equal(items['19'].effect.pushRooms, 1, 'and the Ghost Bell drives them away');
   assert.equal(items['1'].effect.move, 2);
   assert.equal(items['1'].effect.health, 0, 'and it takes no Health with it');
   assert.equal(items['11'].effect.sanityShield, 1, 'the amulet is a ward');

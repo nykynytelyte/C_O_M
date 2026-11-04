@@ -433,7 +433,7 @@ const ctx = { scenario, rooms, entrances, encounterCards, items, events, investi
   // What is still waiting, and what it is waiting for.
   const waiting = createGame(ctx, { seed: 41, playerCount: 2, investigatorIds: ['1', '2'] });
   waiting.players[0].items = ['22', '9', '10', '13'];
-  assert.match(useItemProblem(waiting, ctx, '9'), /needs a monster/);
+  assert.match(useItemProblem(waiting, ctx, '9'), /no monster on or next to/);
   assert.match(useItemProblem(waiting, ctx, '10'), /no monster on or next to/);
   assert.match(useItemProblem(waiting, ctx, '13'), /needs a lock/);
   assert.equal(useItemProblem(waiting, ctx, '22') ?? null, null, 'Dark Dice is no longer waiting for dice');

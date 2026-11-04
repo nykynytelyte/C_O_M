@@ -763,6 +763,8 @@ function parseItemFields(value, id) {
     revealRoom: false,
     hit: null,
     banish: null,
+    bind: null,
+    pushRooms: 0,
   };
 
   for (const token of (value ?? '').split('|').map((t) => t.trim()).filter(Boolean)) {
@@ -774,6 +776,17 @@ function parseItemFields(value, id) {
     // hit:2@1 deals 2 damage to a monster up to 1 space away; banish@1 removes
     // one outright. Range 1 is the investigator's own square and the four next
     // to it.
+    const bind = /^bind@([1-9])$/.exec(token);
+    if (bind) {
+      out.bind = { reach: Number(bind[1]) };
+      continue;
+    }
+    const push = /^push-adjacent-rooms:([1-9])$/.exec(token);
+    if (push) {
+      out.pushRooms = Number(push[1]);
+      continue;
+    }
+
     const strike = /^(?:hit:([1-9][0-9]*)|banish)@([1-9])$/.exec(token);
     if (strike) {
       if (strike[1]) out.hit = { damage: Number(strike[1]), reach: Number(strike[2]) };
@@ -983,6 +996,7 @@ const EVENT_OPS = [
   'swap',
   'monster',
   'monsters-move',
+  'engaged-attack',
 ];
 
 function parseEventRoll(value, id) {
@@ -1047,6 +1061,12 @@ function parseEventEffect(value, id) {
         throw new Error(`event "${id}" spawns a monster "${argument}"; write monster:room or monster:adjacent`);
       }
       ops.push({ kind, where: argument });
+    } else if (kind === 'engaged-attack') {
+      const n = Number(argument);
+      if (!Number.isInteger(n) || n < 1) {
+        throw new Error(`event "${id}" has engaged monsters deal "${argument}", which is not an amount of damage`);
+      }
+      ops.push({ kind, n });
     } else if (kind === 'monsters-move') {
       const n = Number(argument);
       if (!Number.isInteger(n) || n < 1) {
@@ -1308,6 +1328,18 @@ function applyEventOp(state, ctx, op, player) {
       return;
     }
     spawnMonster(state, ctx, open[randomInt(state, open.length)], 'it is summoned');
+    return;
+  }
+
+  if (op.kind === 'engaged-attack') {
+    let any = false;
+    for (const someone of onTable(state)) {
+      for (const monster of engagedWith(state, someone)) {
+        any = true;
+        monsterHits(state, monster, someone, op.n);
+      }
+    }
+    if (!any) pushLog(state, 'Nobody is engaged with a monster, so nothing strikes.');
     return;
   }
 
@@ -1745,6 +1777,10 @@ export function stepProblem(state, from, to, ctx) {
   const dir = travelDir(from, to);
   if (!dir) return 'that space does not share an edge with the current one';
 
+  // "You cannot move through walls or through Monsters."
+  const blocker = (state.monsters ?? []).find((m) => m.pos.gr === to.gr && m.pos.gc === to.gc);
+  if (blocker) return `${theName(blocker.name)} stands in the way`;
+
   const here = slotOf(from);
   const there = slotOf(to);
   if (here.R === there.R && here.C === there.C) return null;
@@ -1793,7 +1829,8 @@ export function stepProblem(state, from, to, ctx) {
  * space: you cannot know what is there until a card has been turned.
  */
 export function legalDestinations(state, ctx) {
-  if (state.pending || state.choice) return [];
+  if (state.pending || state.choice || state.over) return [];
+  if (engagedWith(state, currentPlayer(state)).length > 0) return [];
 
   const allowance =
     state.stepsLeft > 0 ? state.stepsLeft : state.actionsLeft > 0 ? state.moveRange : 0;
@@ -1863,6 +1900,17 @@ export function reduce(state, action, ctx) {
     throw new Error('answer the choice on the table before doing anything else');
   }
 
+  // "While engaged, you may only Attack or Flee." Items cost no action and the
+  // turn can still be ended.
+  if (['MOVE', 'INVESTIGATE', 'SEAL'].includes(action.type)) {
+    const held = engagedWith(next, currentPlayer(next));
+    if (held.length > 0) {
+      throw new Error(
+        `${currentPlayer(next).name} is engaged with the ${held.map((m) => theName(m.name)).map((n) => n).join(' and ')} — Attack or Flee first`,
+      );
+    }
+  }
+
   let out;
   switch (action.type) {
     case 'CHOOSE':
@@ -1885,6 +1933,12 @@ export function reduce(state, action, ctx) {
       break;
     case 'SEAL':
       out = doSeal(next, ctx);
+      break;
+    case 'ATTACK':
+      out = doCombat(next, ctx, 'attack', action.monsterId);
+      break;
+    case 'FLEE':
+      out = doCombat(next, ctx, 'flee', action.monsterId);
       break;
     default:
       throw new Error(`unknown action type "${action.type}"`);
@@ -2079,6 +2133,10 @@ function spawnMonster(state, ctx, pos, why) {
     state,
     `${card.name} (${card.health} Health) appears in the ${room} — ${why}. Monsters on the board: ${monsterCount(state)}.`,
   );
+  // "If a Monster is revealed, players in adjacent spaces become engaged immediately."
+  for (const player of onTable(state)) {
+    if (within(player.pos, monster.pos, 1)) engage(state, player, monster);
+  }
   revealPower(state, ctx, monster, card);
   return monster;
 }
@@ -2112,7 +2170,7 @@ function revealPower(state, ctx, monster, card) {
     }
     const slot = rooms[randomInt(state, rooms.length)];
     const squares = squaresInRoom(slot);
-    spawnMonster(state, ctx, squares[randomInt(state, squares.length)], `the ${card.name} splits`);
+    spawnMonster(state, ctx, squares[randomInt(state, squares.length)], `${theName(card.name)} splits`);
     return;
   }
 
@@ -2122,7 +2180,7 @@ function revealPower(state, ctx, monster, card) {
       const value = rollD6(state, card.ability || card.name);
       if (value >= power.min && value <= power.max) {
         pushLog(state, `${player.name} rolls ${value}.`);
-        changePool(state, player, 'sanity', -1, `the ${card.name}`);
+        changePool(state, player, 'sanity', -1, `${theName(card.name)}`);
       } else {
         pushLog(state, `${player.name} rolls ${value} and holds on.`);
       }
@@ -2148,8 +2206,8 @@ function moveMonstersTowardPlayers(state, ctx, spaces) {
     pushLog(
       state,
       moved === 0
-        ? `The ${monster.name} cannot find a way closer.`
-        : `The ${monster.name} moves toward ${target.name}.`,
+        ? `${theName(monster.name, true)} cannot find a way closer.`
+        : `${theName(monster.name, true)} moves toward ${target.name}.`,
     );
   }
 }
@@ -2178,15 +2236,16 @@ function strikeTargets(state, player, effect) {
 
 function strikeMonster(state, ctx, monster, effect, source) {
   if (effect.banish) {
-    pushLog(state, `The ${source} banishes the ${monster.name}.`);
+    pushLog(state, `The ${source} banishes ${theName(monster.name)}.`);
     removeMonster(state, monster);
     return;
   }
   monster.health = Math.max(0, monster.health - effect.hit.damage);
   pushLog(
     state,
-    `The ${source} deals ${effect.hit.damage} damage to the ${monster.name} — ${monster.health} of ${monster.healthMax} Health left.`,
+    `The ${source} deals ${effect.hit.damage} damage to ${theName(monster.name)} — ${monster.health} of ${monster.healthMax} Health left.`,
   );
+
   if (monster.health > 0) return;
 
   if (monster.kind === 'boss') {
@@ -2195,14 +2254,168 @@ function strikeMonster(state, ctx, monster, effect, source) {
     pushLog(state, ctx.scenario.story?.bossDefeated ?? `${monster.name} is destroyed.`);
     return;
   }
-  pushLog(state, `The ${monster.name} is destroyed.`);
+  pushLog(state, `${theName(monster.name, true)} is destroyed.`);
   removeMonster(state, monster);
 }
 
 function removeMonster(state, monster) {
   state.monsters = state.monsters.filter((m) => m.id !== monster.id);
+  for (const player of state.players) {
+    if (player.engaged) player.engaged = player.engaged.filter((id) => id !== monster.id);
+  }
   if (monster.cardId) state.monsterDiscard.push(monster.cardId);
   if (monster.kind === 'boss') state.boss = null;
+}
+
+/* ------------------------------------------------------------------ *
+ * Combat
+ *
+ * From the rulebook:
+ *   Attack — attack a Monster in an adjacent space; this engages you with it.
+ *            Roll 1d6: 4-6 is a hit, 1-3 a miss and you take 1 damage.
+ *   Flee   — if engaged, roll 1d6: 4+ you escape, 1-3 you fail and take 1
+ *            damage.
+ *   While engaged you may only Attack or Flee. Ending your turn next to a
+ *   Monster engages you, and so does being next to one when it is revealed.
+ *
+ * "Adjacent" is the investigator's own square and the four that share an edge
+ * with it — a monster turned over by Investigate appears under your feet.
+ * ------------------------------------------------------------------ */
+
+/** Damage a hit deals. The rulebook says "hit" and gives no number. */
+const ATTACK_DAMAGE = 1;
+const COMBAT_DAMAGE = 1;
+
+/** "the Mourner", but "The Whisperer" — a name that brings its own article keeps it. */
+function theName(name, capital = false) {
+  if (/^The /.test(name)) return name;
+  return `${capital ? 'The' : 'the'} ${name}`;
+}
+
+function within(a, b, reach) {
+  return Math.abs(a.gr - b.gr) + Math.abs(a.gc - b.gc) <= reach;
+}
+
+/** The monsters this investigator is engaged with, still on the table. */
+export function engagedWith(state, player) {
+  const ids = new Set(player?.engaged ?? []);
+  return (state.monsters ?? []).filter((m) => ids.has(m.id));
+}
+
+function engage(state, player, monster) {
+  if ((player.bound ?? []).includes(monster.id)) return;
+  player.engaged ??= [];
+  if (player.engaged.includes(monster.id)) return;
+  player.engaged.push(monster.id);
+  pushLog(state, `${player.name} is engaged with ${theName(monster.name)}.`);
+}
+
+function disengage(player, monster) {
+  player.engaged = (player.engaged ?? []).filter((id) => id !== monster.id);
+}
+
+/** A monster's blow: Health, or Sanity if it strikes at the mind. */
+function monsterHits(state, monster, player, amount) {
+  const pool = monster.power?.kind === 'damage-to-sanity' ? 'sanity' : 'health';
+  changePool(state, player, pool, -amount, `${theName(monster.name)}`);
+}
+
+/** Why the current investigator cannot Attack or Flee, or null if they can. */
+export function combatProblem(state, kind) {
+  if (state.over) return 'the game is over';
+  if (state.pending) return 'place the drawn room before doing anything else';
+  if (state.choice) return 'answer the choice on the table first';
+  if (state.actionsLeft <= 0) return 'no actions left this turn';
+  const targets = combatTargets(state, currentPlayer(state), kind);
+  if (targets.length > 0) return null;
+  return kind === 'flee'
+    ? 'you are not engaged with any monster'
+    : 'there is no monster on or next to your square to attack';
+}
+
+function combatTargets(state, player, kind) {
+  if (kind === 'flee') return engagedWith(state, player);
+  return (state.monsters ?? []).filter((m) => within(player.pos, m.pos, 1));
+}
+
+function doCombat(state, ctx, kind, monsterId) {
+  const problem = combatProblem(state, kind);
+  if (problem) throw new Error(problem);
+  const player = currentPlayer(state);
+  const targets = combatTargets(state, player, kind);
+
+  let target = null;
+  if (monsterId !== undefined && monsterId !== null) {
+    target = targets.find((m) => m.id === String(monsterId));
+    if (!target) throw new Error(`there is no monster "${monsterId}" to ${kind}`);
+  } else if (targets.length === 1) {
+    target = targets[0];
+  }
+
+  if (!target) {
+    beginChoice(state, {
+      kind,
+      playerId: player.id,
+      prompt: kind === 'attack' ? 'Which monster do you attack?' : 'Which monster do you flee from?',
+      options: targets.map((m) => ({ id: m.id, label: `${m.name} (${m.health} Health)` })),
+    });
+    return state;
+  }
+  resolveCombat(state, ctx, player, target, kind);
+  return state;
+}
+
+function resolveCombat(state, ctx, player, monster, kind) {
+  state.actionsLeft -= 1;
+  const value = rollD6(state, kind === 'attack' ? 'an attack' : 'a flight');
+
+  if (kind === 'attack') {
+    engage(state, player, monster);
+    if (value >= 4) {
+      pushLog(state, `${player.name} attacks ${theName(monster.name)}: ${value} — a hit.`);
+      strikeMonster(state, ctx, monster, { hit: { damage: ATTACK_DAMAGE, reach: 1 } }, 'blow');
+    } else {
+      pushLog(state, `${player.name} attacks ${theName(monster.name)}: ${value} — a miss.`);
+      monsterHits(state, monster, player, COMBAT_DAMAGE);
+    }
+    return;
+  }
+
+  if (value >= 4) {
+    disengage(player, monster);
+    pushLog(state, `${player.name} flees ${theName(monster.name)}: ${value} — free.`);
+  } else {
+    pushLog(state, `${player.name} tries to flee ${theName(monster.name)}: ${value} — caught.`);
+    monsterHits(state, monster, player, COMBAT_DAMAGE);
+  }
+}
+
+/** Binding Chalk: this monster cannot engage the investigator this turn. */
+function bindMonster(state, player, monster, source) {
+  disengage(player, monster);
+  player.bound = [...(player.bound ?? []), monster.id];
+  pushLog(state, `The ${source} holds ${theName(monster.name)} back from ${player.name} for this turn.`);
+}
+
+/** Ghost Bell: monsters in the rooms next to yours are pushed away. */
+function pushMonstersFromAdjacentRooms(state, ctx, player, spaces) {
+  const here = slotOf(player.pos);
+  let pushed = 0;
+  for (const monster of state.monsters ?? []) {
+    if (monster.kind === 'boss') continue;
+    const at = slotOf(monster.pos);
+    if (Math.abs(at.R - here.R) + Math.abs(at.C - here.C) !== 1) continue;
+    for (let step = 0; step < spaces; step++) {
+      const gap = (p) => Math.abs(p.gr - player.pos.gr) + Math.abs(p.gc - player.pos.gc);
+      const away = DIRS.map((d) => ({ gr: monster.pos.gr + d.dr, gc: monster.pos.gc + d.dc }))
+        .filter((to) => gap(to) > gap(monster.pos))
+        .find((to) => roomEntryAt(state, slotOf(to)) && !stepProblem(state, monster.pos, to, ctx));
+      if (!away) break;
+      monster.pos = away;
+      pushed += 1;
+    }
+  }
+  pushLog(state, pushed === 0 ? 'The bell rings, but nothing nearby is moved.' : 'The bell rings and the monsters next door are driven back.');
 }
 
 /* ------------------------------------------------------------------ *
@@ -2319,6 +2532,9 @@ export function sealProblem(state, ctx) {
   if (state.choice) return 'answer the choice on the table first';
   if (state.boss) return 'the Presence has manifested — the Rift can no longer be sealed';
   if (state.actionsLeft <= 0) return 'no actions left this turn';
+  if (engagedWith(state, currentPlayer(state)).length > 0) {
+    return 'you are engaged with a monster — Attack or Flee first';
+  }
   const slot = bossRoomSlot(state, ctx);
   const roomName = ctx.rooms[seal.room]?.name ?? seal.room;
   if (seal.allRoomsRevealed && (state.roomDeck.length > 0 || !slot)) {
@@ -2409,13 +2625,16 @@ export function investigateProblem(state) {
   if (state.pending) return 'place the drawn room before doing anything else';
   if (state.choice) return 'answer the choice on the table first';
   if (state.actionsLeft <= 0) return 'no actions left this turn';
+  if (engagedWith(state, currentPlayer(state)).length > 0) {
+    return 'you are engaged with a monster — Attack or Flee first';
+  }
 
   const here = slotOf(currentPlayer(state).pos);
   const mourner = (state.monsters ?? []).find((m) => {
     const at = slotOf(m.pos);
     return m.power?.kind === 'blocks-investigate-room' && at.R === here.R && at.C === here.C;
   });
-  if (mourner) return `the ${mourner.name} is in this room, and nobody can Investigate while it weeps`;
+  if (mourner) return `${theName(mourner.name)} is in this room, and nobody can Investigate while it weeps`;
 
   const marker = state.encounters?.[posKey(currentPlayer(state).pos)];
   if (!marker) return 'there is no encounter card on this square to investigate';
@@ -2479,6 +2698,9 @@ export function useItemProblem(state, ctx, itemId) {
   if (item.needs.length > 0) {
     const words = item.needs.map((need) => NEED_WORD[need]);
     return `the ${item.name} is still pending: it needs ${words.join(' and ')}, which the game does not have yet, so it does nothing for now`;
+  }
+  if (item.effect.bind && strikeTargets(state, player, { banish: item.effect.bind }).length === 0) {
+    return `there is no monster on or next to ${player.name}'s square for the ${item.name}`;
   }
   const strike = item.effect.hit ?? item.effect.banish;
   if (strike && strikeTargets(state, player, item.effect).length === 0) {
@@ -2598,6 +2820,20 @@ function doChoose(state, action, ctx) {
 function resolveChoice(state, ctx, choice, picked) {
   const chooser = state.players.find((player) => player.id === choice.playerId);
   if (!chooser) throw new Error('the choice names an investigator who is not at the table');
+
+  if (choice.kind === 'attack' || choice.kind === 'flee') {
+    const target = (state.monsters ?? []).find((m) => m.id === picked.id);
+    if (!target) throw new Error('that monster is no longer on the table');
+    resolveCombat(state, ctx, chooser, target, choice.kind);
+    return;
+  }
+
+  if (choice.kind === 'bind') {
+    const target = (state.monsters ?? []).find((m) => m.id === picked.id);
+    if (!target) throw new Error('that monster is no longer on the table');
+    bindMonster(state, chooser, target, choice.source);
+    return;
+  }
 
   if (choice.kind === 'strike') {
     const target = (state.monsters ?? []).find((m) => m.id === picked.id);
@@ -2754,6 +2990,23 @@ function applyItemFields(state, ctx, item, player, effect) {
     pushLog(state, 'The next wound taken will be ignored, whatever it is dealt by.');
   }
 
+  if (effect.bind) {
+    const targets = strikeTargets(state, player, { banish: effect.bind });
+    if (targets.length === 1) {
+      bindMonster(state, player, targets[0], item.name);
+    } else if (targets.length > 1) {
+      beginChoice(state, {
+        kind: 'bind',
+        playerId: player.id,
+        prompt: `Which monster does the ${item.name} hold back?`,
+        options: targets.map((m) => ({ id: m.id, label: m.name })),
+        source: item.name,
+      });
+    }
+  }
+
+  if (effect.pushRooms) pushMonstersFromAdjacentRooms(state, ctx, player, effect.pushRooms);
+
   if (effect.hit || effect.banish) {
     const targets = strikeTargets(state, player, effect);
     if (targets.length === 1) {
@@ -2817,11 +3070,24 @@ function advance(state, steps, ctx, playerId) {
   const player = state.players.find((p) => p.id === playerId);
   if (!player) throw new Error(`unknown player "${playerId}"`);
 
+  let taken = 0;
   while (steps.length > 0) {
     const to = steps[0];
     const from = player.pos;
+    // Something met on the way — a monster turned up by an entrance card, or
+    // one that engaged the investigator — ends the walk where they stand. The
+    // steps already taken stay taken.
+    if (taken > 0 && engagedWith(state, player).length > 0) {
+      pushLog(state, `${player.name} is caught and stops.`);
+      break;
+    }
     const problem = stepProblem(state, from, to, ctx);
+    if (problem && taken > 0) {
+      pushLog(state, `${player.name} stops: ${problem}.`);
+      break;
+    }
     if (problem) throw new Error(problem);
+    taken += 1;
 
     const here = slotOf(from);
     const there = slotOf(to);
@@ -2928,6 +3194,16 @@ function doEndTurn(state, ctx) {
   // investigator is standing where they stopped — see revealAtEndOfTurn. The
   // mansion does not: looking into a card costs one of the turn's two actions.
   revealAtEndOfTurn(state, ctx, player);
+
+  // "If a Monster is in an adjacent space at the end of a player's turn, that
+  // player becomes engaged."
+  if (!player.out && !player.down) {
+    for (const monster of state.monsters ?? []) {
+      if (within(player.pos, monster.pos, 1)) engage(state, player, monster);
+    }
+  }
+  player.bound = [];
+  player.fledReroll = false;
 
   let nextSeat = state.turnIndex + 1;
   while (nextSeat < state.players.length && state.players[nextSeat].out) nextSeat += 1;

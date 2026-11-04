@@ -17,6 +17,8 @@ import {
   investigateProblem,
   useItemProblem,
   sealProblem,
+  combatProblem,
+  engagedWith,
   monsterCount,
   pendingOrientations,
   roomsFromCsv,
@@ -137,6 +139,8 @@ const riftOpen = (game) => {
     room: '-1,0', number: 4, cardId: '9', type: null, faceUp: false, entranceId: '17',
   };
   game.players[0].pos = { gr: -2, gc: 0 };
+  assert.match(investigateProblem(game), /engaged/, 'revealing it beside you engages you');
+  game.players[0].engaged = [];
   assert.match(investigateProblem(game), /Mourner is in this room/, 'Wail of Stillness');
   game.players[0].pos = { gr: 1, gc: 1 };
   assert.doesNotMatch(investigateProblem(game) ?? '', /Mourner/, 'but only in its own room');
@@ -232,6 +236,98 @@ const riftOpen = (game) => {
   assert.equal(asked.choice?.kind, 'strike', 'two targets: the player picks');
   const cut = reduce(asked, { type: 'CHOOSE', optionId: asked.choice.options[1].id }, ctx);
   assert.equal(cut.monsters.find((m) => m.cardId === '8').health, 1, 'Ritual Knife: 2 damage');
+}
+
+/* ------------------------------------------------------------------ *
+ * Combat, from the rulebook
+ * ------------------------------------------------------------------ */
+{
+  // Attack: 4-6 hits, 1-3 misses and the attacker takes 1 damage.
+  const faces = { hit: 0, miss: 0 };
+  for (let seed = 1; seed <= 40; seed++) {
+    const game = start({ seed });
+    card(game, '8', { gr: 1, gc: 2 }); // Mad Reflection, 3 Health
+    const before = { ...game.players[0] };
+    const after = reduce(game, { type: 'ATTACK' }, ctx);
+    const roll = after.lastRoll.value;
+    const me = after.players[0];
+    assert.equal(after.actionsLeft, game.actionsLeft - 1, 'an attack is an action');
+    assert.deepEqual(me.engaged, [after.monsters[0].id], 'attacking engages you');
+    if (roll >= 4) {
+      faces.hit += 1;
+      assert.equal(after.monsters[0].health, 2, `a ${roll} hits for 1`);
+      assert.equal(me.sanity, before.sanity);
+    } else {
+      faces.miss += 1;
+      assert.equal(after.monsters[0].health, 3, `a ${roll} misses`);
+      // Mind Mirror: the Mad Reflection's blow lands on Sanity, not Health.
+      assert.ok(me.sanity < before.sanity, 'a miss costs the attacker, in Sanity');
+      assert.equal(me.health, before.health);
+    }
+  }
+  assert.ok(faces.hit > 0 && faces.miss > 0, 'both faces of an attack were seen');
+
+  // While engaged: only Attack or Flee.
+  const held = start();
+  card(held, '1', { gr: 1, gc: 2 });
+  held.players[0].engaged = [held.monsters[0].id];
+  assert.throws(() => reduce(held, { type: 'MOVE', path: [{ gr: 0, gc: 1 }] }, ctx), /Attack or Flee/);
+  assert.match(investigateProblem(held), /engaged/);
+  assert.equal(combatProblem(held, 'flee'), null);
+
+  // Flee: 4+ escapes, 1-3 fails and costs 1 Health.
+  const fled = { free: 0, caught: 0 };
+  for (let seed = 1; seed <= 40; seed++) {
+    const game = start({ seed });
+    card(game, '1', { gr: 1, gc: 2 });
+    game.players[0].engaged = [game.monsters[0].id];
+    const after = reduce(game, { type: 'FLEE' }, ctx);
+    const roll = after.lastRoll.value;
+    if (roll >= 4) {
+      fled.free += 1;
+      assert.deepEqual(engagedWith(after, after.players[0]), [], `a ${roll} escapes`);
+    } else {
+      fled.caught += 1;
+      assert.equal(engagedWith(after, after.players[0]).length, 1, `a ${roll} does not`);
+      assert.equal(after.players[0].health, game.players[0].health - 1, 'and costs 1 Health');
+    }
+  }
+  assert.ok(fled.free > 0 && fled.caught > 0, 'both faces of a flight were seen');
+
+  // Ending a turn beside a monster engages you.
+  const lingering = start();
+  card(lingering, '4', { gr: 2, gc: 1 });
+  lingering.players[1].pos = { gr: 0, gc: 0 };
+  const ended = reduce(lingering, { type: 'END_TURN' }, ctx);
+  assert.equal(engagedWith(ended, ended.players[0]).length, 1, 'next to it at the end of the turn');
+
+  // Binding Chalk keeps it off you this turn.
+  const chalked = start();
+  card(chalked, '4', { gr: 2, gc: 1 });
+  chalked.players[0].items = ['9'];
+  const bound = reduce(chalked, { type: 'USE_ITEM', itemId: '9' }, ctx);
+  const passed = reduce(bound, { type: 'END_TURN' }, ctx);
+  assert.equal(engagedWith(passed, passed.players[0]).length, 0, 'Binding Chalk holds it back');
+
+  // Monsters block movement.
+  const blocked = start();
+  card(blocked, '4', { gr: 1, gc: 2 });
+  blocked.players[0].engaged = [];
+  blocked.players[0].bound = [blocked.monsters[0].id];
+  assert.throws(
+    () => reduce(blocked, { type: 'MOVE', path: [{ gr: 1, gc: 2 }] }, ctx),
+    /stands in the way/,
+  );
+
+  // Event 29: every engaged monster deals 1 damage.
+  const struck = enterRoom(start({ encounters: [EVENT_ENCOUNTER], events: ['29'] }));
+  const key = struck.lastEntrance.placed[0];
+  struck.players[0].pos = at(key);
+  card(struck, '1', { gr: 1, gc: 1 });
+  struck.players[1].engaged = [struck.monsters[0].id];
+  const afterEvent = reduce(struck, { type: 'INVESTIGATE' }, ctx);
+  assert.equal(afterEvent.players[1].health, struck.players[1].health - 1, 'event 29 bites the engaged');
+  assert.equal(afterEvent.players[0].health, struck.players[0].health, 'and nobody else');
 }
 
 /* ------------------------------------------------------------------ *
@@ -332,6 +428,10 @@ const riftOpen = (game) => {
         game = reduce(game, { type: 'PLACE_ROOM', orient: pendingOrientations(game, ctx)[0] }, ctx);
       } else if (!sealProblem(game, ctx)) {
         game = reduce(game, { type: 'SEAL' }, ctx);
+      } else if (!combatProblem(game, 'attack') && rand() < 0.5) {
+        game = reduce(game, { type: 'ATTACK' }, ctx);
+      } else if (!combatProblem(game, 'flee') && rand() < 0.6) {
+        game = reduce(game, { type: 'FLEE' }, ctx);
       } else if (!investigateProblem(game) && rand() < 0.6) {
         game = reduce(game, { type: 'INVESTIGATE' }, ctx);
       } else {

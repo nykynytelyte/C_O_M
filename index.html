@@ -560,8 +560,10 @@
         loss. At 0 Health an investigator has fallen; at 0 Sanity they go mad and become a monster
         where they stood. Either way they are out, and the player picks a new investigator, who
         starts in the Foyer. Monsters come from the scenario's own deck: a Monster card turned over brings one onto its
-        square, and the Wrench, Revolver, Knife and Holy Water can strike them. A few cards are still
-        pending: they wait on monster engagement, a
+        square, and the Wrench, Revolver, Knife and Holy Water can strike them. Attack a monster on or next to you (4-6 hits, 1-3 misses and hurts you); end your turn
+        beside one, or be beside one when it appears, and you are engaged — then you may only Attack
+        or Flee (4+ escapes, 1-3 hurts you). Monsters block movement. A few cards are still
+        pending: they wait on a
         choice, another investigator, a die, a lock or the encounter deck put back in order, and they
         say so when they turn up instead of pretending to work.
       </p>
@@ -593,6 +595,8 @@
           <h2>Actions</h2>
           <div class="controls">
             <button class="btn" id="investigate">Investigate</button>
+            <button class="btn" id="attack">Attack</button>
+            <button class="btn" id="flee">Flee</button>
             <button class="btn" id="seal">Seal the Rift</button>
             <button class="btn primary" id="endturn">End turn</button>
           </div>
