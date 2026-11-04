@@ -268,6 +268,100 @@ function revealMode(scenario) {
 }
 
 /* ------------------------------------------------------------------ *
+ * Monster cards
+ *
+ * The base encounter deck says Monster; it does not say which. That is the
+ * scenario's to say: each scenario brings its own monster deck, and a Monster
+ * encounter card turned over sends you to it. The monster that comes off it
+ * stands on the square where the card lay.
+ *
+ * `power` is what the monster does, from a small vocabulary:
+ *
+ *   spawn-adjacent-room@5-6   when revealed, roll 1d6; on 5-6 another monster
+ *                             appears in a room next to this one
+ *   all-players-sanity@1-2    when revealed, every investigator rolls 1d6 and
+ *                             loses 1 Sanity on 1-2
+ *   blocks-investigate-room   nobody can Investigate in the same room
+ *   damage-to-sanity          the damage it deals comes off Sanity, not Health
+ * ------------------------------------------------------------------ */
+
+const MONSTER_POWERS = {
+  'spawn-adjacent-room': { banded: true },
+  'all-players-sanity': { banded: true },
+  'blocks-investigate-room': { banded: false },
+  'damage-to-sanity': { banded: false },
+};
+
+function parseMonsterPower(value, id) {
+  const text = (value ?? '').trim();
+  if (text === '') return null;
+  const [kind, band] = text.split('@');
+  const rule = MONSTER_POWERS[kind];
+  if (!rule) {
+    throw new Error(
+      `monster "${id}" has the power "${kind}", which is not one of ${Object.keys(MONSTER_POWERS).join(', ')}`,
+    );
+  }
+  if (!rule.banded) {
+    if (band !== undefined) throw new Error(`monster "${id}": ${kind} takes no die roll`);
+    return { kind };
+  }
+  const match = /^([1-6])(?:-([1-6]))?$/.exec(band ?? '');
+  if (!match) throw new Error(`monster "${id}": ${kind} needs a d6 band, like ${kind}@5-6`);
+  const min = Number(match[1]);
+  const max = match[2] ? Number(match[2]) : min;
+  if (min > max) throw new Error(`monster "${id}" has its band backwards`);
+  return { kind, min, max };
+}
+
+/**
+ * Turn a scenario's monster CSV into a map of id -> card.
+ * Expected columns: id, name, health, and — if the deck has them — ability,
+ * power, text, flavor.
+ */
+export function monstersFromCsv(text) {
+  const [header, ...rows] = parseCsv(text);
+  if (!header) throw new Error('monster CSV is empty');
+  const column = (name, required = true) => {
+    const index = header.indexOf(name);
+    if (index === -1 && required) throw new Error(`monster CSV is missing the "${name}" column`);
+    return index;
+  };
+  const iId = column('id');
+  const iName = column('name');
+  const iHealth = column('health');
+  const iAbility = column('ability', false);
+  const iPower = column('power', false);
+  const iText = column('text', false);
+  const iFlavor = column('flavor', false);
+  const cell = (row, index) => (index === -1 ? '' : (row[index] ?? '').trim());
+
+  const cards = {};
+  for (const row of rows) {
+    const id = cell(row, iId);
+    if (!id) continue;
+    if (cards[id]) throw new Error(`monster CSV has a duplicate id: "${id}"`);
+    const name = cell(row, iName);
+    if (!name) throw new Error(`monster "${id}" has no name`);
+    const health = Number(cell(row, iHealth));
+    if (!Number.isInteger(health) || health < 1) {
+      throw new Error(`monster "${id}" has "${cell(row, iHealth)}" for Health; it needs a whole number of at least 1`);
+    }
+    cards[id] = {
+      id,
+      name,
+      health,
+      ability: cell(row, iAbility),
+      power: parseMonsterPower(cell(row, iPower), id),
+      text: cell(row, iText),
+      flavor: cell(row, iFlavor),
+    };
+  }
+  if (Object.keys(cards).length === 0) throw new Error('monster CSV has no monsters');
+  return cards;
+}
+
+/* ------------------------------------------------------------------ *
  * Core rules and scenarios
  * ------------------------------------------------------------------ */
 
@@ -667,11 +761,23 @@ function parseItemFields(value, id) {
     pull: 0,
     giveClue: 0,
     revealRoom: false,
+    hit: null,
+    banish: null,
   };
 
   for (const token of (value ?? '').split('|').map((t) => t.trim()).filter(Boolean)) {
     if (token === 'reveal-room') {
       out.revealRoom = true;
+      continue;
+    }
+
+    // hit:2@1 deals 2 damage to a monster up to 1 space away; banish@1 removes
+    // one outright. Range 1 is the investigator's own square and the four next
+    // to it.
+    const strike = /^(?:hit:([1-9][0-9]*)|banish)@([1-9])$/.exec(token);
+    if (strike) {
+      if (strike[1]) out.hit = { damage: Number(strike[1]), reach: Number(strike[2]) };
+      else out.banish = { reach: Number(strike[2]) };
       continue;
     }
 
@@ -875,6 +981,8 @@ const EVENT_OPS = [
   'shuffle-back',
   'discard-item',
   'swap',
+  'monster',
+  'monsters-move',
 ];
 
 function parseEventRoll(value, id) {
@@ -932,6 +1040,17 @@ function parseEventEffect(value, id) {
       const n = Number(argument);
       if (!Number.isInteger(n) || n === 0) {
         throw new Error(`event "${id}" changes ${kind} by "${argument}", which is not a number of anything`);
+      }
+      ops.push({ kind, n });
+    } else if (kind === 'monster') {
+      if (!['room', 'adjacent'].includes(argument)) {
+        throw new Error(`event "${id}" spawns a monster "${argument}"; write monster:room or monster:adjacent`);
+      }
+      ops.push({ kind, where: argument });
+    } else if (kind === 'monsters-move') {
+      const n = Number(argument);
+      if (!Number.isInteger(n) || n < 1) {
+        throw new Error(`event "${id}" moves monsters "${argument}" spaces, which is not a number of spaces`);
       }
       ops.push({ kind, n });
     } else if (kind === 'teleport') {
@@ -1175,6 +1294,25 @@ function applyEventOp(state, ctx, op, player) {
   if (op.kind === 'investigate-fails') {
     state.investigatePenalty = (state.investigatePenalty ?? 0) + 1;
     pushLog(state, 'The next Investigate action will fail.');
+    return;
+  }
+
+  if (op.kind === 'monster') {
+    const squares =
+      op.where === 'room'
+        ? squaresInRoom(slotOf(player.pos))
+        : DIRS.map((dir) => ({ gr: player.pos.gr + dir.dr, gc: player.pos.gc + dir.dc }));
+    const open = squares.filter((pos) => roomEntryAt(state, slotOf(pos)));
+    if (open.length === 0) {
+      pushLog(state, 'There is nowhere on the table for a monster to appear.');
+      return;
+    }
+    spawnMonster(state, ctx, open[randomInt(state, open.length)], 'it is summoned');
+    return;
+  }
+
+  if (op.kind === 'monsters-move') {
+    moveMonstersTowardPlayers(state, ctx, op.n);
     return;
   }
 
@@ -1497,8 +1635,14 @@ export function createGame(ctx, options = {}) {
     choice: null,
     // Who has been played this game, so a fallen investigator is not dealt again.
     usedInvestigators: seats ? [...seats] : [],
-    // Investigators the house has kept. They stand where they went mad.
+    // Everything standing on the board that is not an investigator: monsters
+    // from the scenario's deck, investigators the house has kept, and the boss.
     monsters: [],
+    nextMonster: 1,
+    monsterDeck: [],
+    monsterDiscard: [],
+    boss: null,
+    sealClues: 0,
     turnLost: null,
     over: null,
     log: [],
@@ -1537,6 +1681,12 @@ export function createGame(ctx, options = {}) {
     ? Object.keys(ctx.events).sort((a, b) => Number(a) - Number(b))
     : [];
   state.eventDeck = shuffle(state, eventIds);
+
+  // The scenario's monster deck, shuffled last of all for the same reason.
+  const monsterIds = ctx.monsterCards
+    ? Object.keys(ctx.monsterCards).sort((a, b) => Number(a) - Number(b))
+    : [];
+  state.monsterDeck = shuffle(state, monsterIds);
 
   pushLog(
     state,
@@ -1733,9 +1883,14 @@ export function reduce(state, action, ctx) {
     case 'END_TURN':
       out = doEndTurn(next, ctx);
       break;
+    case 'SEAL':
+      out = doSeal(next, ctx);
+      break;
     default:
       throw new Error(`unknown action type "${action.type}"`);
   }
+  settleCasualties(out, ctx);
+  checkSummoning(out, ctx);
   settleCasualties(out, ctx);
   return out;
 }
@@ -1771,11 +1926,11 @@ function settleCasualties(state, ctx) {
     if (ownTurn) state.turnLost = player.id;
 
     if (player.down === 'mad') {
-      state.monsters ??= [];
-      state.monsters.push({
-        id: `m${state.monsters.length + 1}`,
+      addMonster(state, {
+        kind: 'mad',
         name: `${player.name}, lost to madness`,
         fromInvestigator: player.investigatorId ?? null,
+        health: MAD_MONSTER_HEALTH,
         pos: { ...player.pos },
       });
       pushLog(state, `${player.name} has gone mad. Where they stood, there is now a monster.`);
@@ -1796,7 +1951,7 @@ function settleCasualties(state, ctx) {
       pushLog(state, `No one is left to take ${player.name}'s place.`);
       if (state.players.every((p) => p.out)) {
         state.over = { result: 'lost', reason: 'Every investigator is gone.' };
-        pushLog(state, 'Every investigator is gone. The house has won.');
+        pushLog(state, ctx.scenario.story?.lost ?? 'Every investigator is gone. The house has won.');
         return;
       }
       continue;
@@ -1855,6 +2010,356 @@ function startPosition(state, ctx) {
   return null;
 }
 
+/* ------------------------------------------------------------------ *
+ * Monsters on the board
+ * ------------------------------------------------------------------ */
+
+/**
+ * The scenario does not say how much it takes to put down an investigator the
+ * house has kept, so for now one blow is enough.
+ */
+const MAD_MONSTER_HEALTH = 1;
+
+function addMonster(state, monster) {
+  state.monsters ??= [];
+  state.nextMonster ??= state.monsters.length + 1;
+  const entry = { id: `m${state.nextMonster}`, healthMax: monster.health, ...monster };
+  state.nextMonster += 1;
+  state.monsters.push(entry);
+  return entry;
+}
+
+/** The monsters that count toward a summoning: everything but the boss. */
+export function monsterCount(state) {
+  return (state.monsters ?? []).filter((m) => m.kind !== 'boss').length;
+}
+
+function posOfKey(key) {
+  const [gr, gc] = key.split(',').map(Number);
+  return { gr, gc };
+}
+
+function squaresInRoom(slot) {
+  const out = [];
+  for (let r = 0; r < ROOM_SIZE; r++) {
+    for (let c = 0; c < ROOM_SIZE; c++) out.push(posOf(slot.R, slot.C, r, c));
+  }
+  return out;
+}
+
+/**
+ * Bring the next monster off the scenario's deck onto a square, and let it do
+ * what it does when it is revealed.
+ */
+function spawnMonster(state, ctx, pos, why) {
+  if (!ctx.monsterCards) {
+    pushLog(state, 'This scenario brings no monster deck, so nothing comes.');
+    return null;
+  }
+  const cardId = drawFrom(state, 'monsterDeck', 'monsterDiscard', 'monster');
+  if (cardId === null) {
+    pushLog(state, 'Every monster in the deck is already on the board, so nothing more comes.');
+    return null;
+  }
+  const card = ctx.monsterCards[cardId];
+  if (!card) throw new Error(`unknown monster card "${cardId}"`);
+
+  const slot = slotOf(pos);
+  const entry = roomEntryAt(state, slot);
+  const room = entry ? ctx.rooms[entry.roomId].name : 'the dark';
+  const monster = addMonster(state, {
+    kind: 'card',
+    cardId,
+    name: card.name,
+    health: card.health,
+    power: card.power,
+    pos: { ...pos },
+  });
+  pushLog(
+    state,
+    `${card.name} (${card.health} Health) appears in the ${room} — ${why}. Monsters on the board: ${monsterCount(state)}.`,
+  );
+  revealPower(state, ctx, monster, card);
+  return monster;
+}
+
+function rollD6(state, source) {
+  const value = randomInt(state, 6) + 1;
+  state.lastRoll = { value, die: 6, source };
+  return value;
+}
+
+/** What a monster does the moment it is revealed. */
+function revealPower(state, ctx, monster, card) {
+  const power = card.power;
+  if (!power) return;
+
+  if (power.kind === 'spawn-adjacent-room') {
+    const value = rollD6(state, card.ability || card.name);
+    const hits = value >= power.min && value <= power.max;
+    pushLog(
+      state,
+      `${card.ability || card.name}: the die comes up ${value}${hits ? '' : ' — nothing follows'}.`,
+    );
+    if (!hits) return;
+    const here = slotOf(monster.pos);
+    const rooms = DIRS.map((dir) => ({ R: here.R + dir.dr, C: here.C + dir.dc })).filter((slot) =>
+      roomEntryAt(state, slot),
+    );
+    if (rooms.length === 0) {
+      pushLog(state, 'There is no room next to this one for another monster to appear in.');
+      return;
+    }
+    const slot = rooms[randomInt(state, rooms.length)];
+    const squares = squaresInRoom(slot);
+    spawnMonster(state, ctx, squares[randomInt(state, squares.length)], `the ${card.name} splits`);
+    return;
+  }
+
+  if (power.kind === 'all-players-sanity') {
+    pushLog(state, `${card.ability || card.name}: every investigator rolls.`);
+    for (const player of onTable(state)) {
+      const value = rollD6(state, card.ability || card.name);
+      if (value >= power.min && value <= power.max) {
+        pushLog(state, `${player.name} rolls ${value}.`);
+        changePool(state, player, 'sanity', -1, `the ${card.name}`);
+      } else {
+        pushLog(state, `${player.name} rolls ${value} and holds on.`);
+      }
+    }
+  }
+}
+
+/**
+ * "All monsters move 1 space toward the nearest player." They walk like
+ * investigators do — through doors, not walls — and the boss is not a monster
+ * for this, because it moves by its own card.
+ */
+function moveMonstersTowardPlayers(state, ctx, spaces) {
+  const seated = onTable(state);
+  const movers = (state.monsters ?? []).filter((m) => m.kind !== 'boss');
+  if (movers.length === 0 || seated.length === 0) {
+    pushLog(state, 'There are no monsters on the board to move.');
+    return;
+  }
+  for (const monster of movers) {
+    const target = nearestPlayer(state, monster.pos, false);
+    const moved = drawToward(state, ctx, monster, target.pos, spaces);
+    pushLog(
+      state,
+      moved === 0
+        ? `The ${monster.name} cannot find a way closer.`
+        : `The ${monster.name} moves toward ${target.name}.`,
+    );
+  }
+}
+
+function nearestPlayer(state, pos, diagonal) {
+  const gap = (p) =>
+    diagonal
+      ? Math.max(Math.abs(p.gr - pos.gr), Math.abs(p.gc - pos.gc))
+      : Math.abs(p.gr - pos.gr) + Math.abs(p.gc - pos.gc);
+  let best = null;
+  for (const player of onTable(state)) {
+    if (!best || gap(player.pos) < gap(best.pos)) best = player;
+  }
+  return best;
+}
+
+/** Monsters a weapon in this investigator's hand can reach. */
+function strikeTargets(state, player, effect) {
+  const reach = (effect.hit ?? effect.banish).reach;
+  return (state.monsters ?? []).filter((m) => {
+    if (effect.banish && m.kind === 'boss') return false;
+    const gap = Math.abs(m.pos.gr - player.pos.gr) + Math.abs(m.pos.gc - player.pos.gc);
+    return gap <= reach;
+  });
+}
+
+function strikeMonster(state, ctx, monster, effect, source) {
+  if (effect.banish) {
+    pushLog(state, `The ${source} banishes the ${monster.name}.`);
+    removeMonster(state, monster);
+    return;
+  }
+  monster.health = Math.max(0, monster.health - effect.hit.damage);
+  pushLog(
+    state,
+    `The ${source} deals ${effect.hit.damage} damage to the ${monster.name} — ${monster.health} of ${monster.healthMax} Health left.`,
+  );
+  if (monster.health > 0) return;
+
+  if (monster.kind === 'boss') {
+    removeMonster(state, monster);
+    state.over = { result: 'won', reason: `${monster.name} is destroyed.` };
+    pushLog(state, ctx.scenario.story?.bossDefeated ?? `${monster.name} is destroyed.`);
+    return;
+  }
+  pushLog(state, `The ${monster.name} is destroyed.`);
+  removeMonster(state, monster);
+}
+
+function removeMonster(state, monster) {
+  state.monsters = state.monsters.filter((m) => m.id !== monster.id);
+  if (monster.cardId) state.monsterDiscard.push(monster.cardId);
+  if (monster.kind === 'boss') state.boss = null;
+}
+
+/* ------------------------------------------------------------------ *
+ * The scenario's endgame: summoning, the boss, and sealing
+ * ------------------------------------------------------------------ */
+
+function bossRoomSlot(state, ctx) {
+  const roomId = ctx.scenario.bossRoom;
+  for (const [key, entry] of Object.entries(state.rooms)) {
+    if (entry.roomId !== roomId) continue;
+    const [R, C] = key.split(',').map(Number);
+    return { R, C };
+  }
+  return null;
+}
+
+/**
+ * The boss appears once the scenario's summoning condition is met: its room is
+ * on the table and enough monsters stand on the board. Checked after every
+ * action, so it arrives the moment the condition holds.
+ */
+function checkSummoning(state, ctx) {
+  const { summon, boss } = ctx.scenario;
+  if (!summon || !boss || state.over || state.boss || state.bossDefeated) return;
+  if (state.pending || state.choice) return;
+
+  const slot = bossRoomSlot(state, ctx);
+  if (summon.bossRoomRevealed && !slot) return;
+  if (monsterCount(state) < (summon.monstersAtLeast ?? 0)) return;
+
+  const pos = slot ? posOfNumber(slot, boss.space ?? 5) : startPosition(state, ctx);
+  const entry = addMonster(state, {
+    kind: 'boss',
+    bossId: boss.id,
+    name: boss.name,
+    health: boss.health,
+    movement: boss.movement ?? 1,
+    ignoresWalls: Boolean(boss.ignoresWalls),
+    diagonal: Boolean(boss.diagonal),
+    aura: boss.aura ?? null,
+    onSanityLoss: boss.onSanityLoss ?? null,
+    pos,
+  });
+  state.boss = entry.id;
+  if (ctx.scenario.story?.bossArrives) pushLog(state, ctx.scenario.story.bossArrives);
+  pushLog(state, `${boss.name} manifests in the ${ctx.rooms[ctx.scenario.bossRoom]?.name ?? 'house'}.`);
+}
+
+function bossOnBoard(state) {
+  return (state.monsters ?? []).find((m) => m.kind === 'boss') ?? null;
+}
+
+/** "Each time a player loses Sanity: roll 1d6. On a 1-2, they lose 1 additional Sanity." */
+function ruptureOfSelf(state, player) {
+  const boss = bossOnBoard(state);
+  const rule = boss?.onSanityLoss;
+  if (!rule || state.rupturing) return;
+  const value = rollD6(state, rule.name);
+  if (value < rule.min || value > rule.max) {
+    pushLog(state, `${rule.name}: ${value} — ${player.name} holds together.`);
+    return;
+  }
+  pushLog(state, `${rule.name}: ${value}.`);
+  state.rupturing = true;
+  changePool(state, player, 'sanity', rule.sanity, rule.name);
+  state.rupturing = false;
+}
+
+/**
+ * The boss at the end of a round: it moves toward the nearest investigator —
+ * through walls and on the diagonal, if its card says so — and then its aura
+ * takes Sanity from everyone beside it.
+ */
+function bossAtRoundEnd(state, ctx) {
+  const boss = bossOnBoard(state);
+  if (!boss || onTable(state).length === 0) return;
+
+  for (let step = 0; step < boss.movement; step++) {
+    const target = nearestPlayer(state, boss.pos, boss.diagonal);
+    if (!target) break;
+    const dr = Math.sign(target.pos.gr - boss.pos.gr);
+    const dc = Math.sign(target.pos.gc - boss.pos.gc);
+    if (dr === 0 && dc === 0) break;
+    const tries = boss.diagonal && dr && dc
+      ? [{ dr, dc }, { dr, dc: 0 }, { dr: 0, dc }]
+      : [{ dr, dc: 0 }, { dr: 0, dc }].filter((d) => d.dr || d.dc);
+    const to = tries
+      .map((d) => ({ gr: boss.pos.gr + d.dr, gc: boss.pos.gc + d.dc }))
+      .find(
+        (pos) =>
+          roomEntryAt(state, slotOf(pos)) &&
+          (boss.ignoresWalls || !stepProblem(state, boss.pos, pos, ctx)),
+      );
+    if (!to) break;
+    boss.pos = to;
+    pushLog(state, `${boss.name} drifts toward ${target.name}.`);
+  }
+
+  if (boss.aura) {
+    for (const player of onTable(state)) {
+      const near =
+        Math.max(Math.abs(player.pos.gr - boss.pos.gr), Math.abs(player.pos.gc - boss.pos.gc)) <= 1;
+      if (near) changePool(state, player, 'sanity', boss.aura.sanity, boss.aura.name);
+    }
+  }
+}
+
+/** Why the current investigator cannot spend clues on the seal, or null. */
+export function sealProblem(state, ctx) {
+  const seal = ctx.scenario.seal;
+  if (!seal) return 'this scenario has nothing to seal';
+  if (state.over) return 'the game is over';
+  if (state.pending) return 'place the drawn room before doing anything else';
+  if (state.choice) return 'answer the choice on the table first';
+  if (state.boss) return 'the Presence has manifested — the Rift can no longer be sealed';
+  if (state.actionsLeft <= 0) return 'no actions left this turn';
+  const slot = bossRoomSlot(state, ctx);
+  const roomName = ctx.rooms[seal.room]?.name ?? seal.room;
+  if (seal.allRoomsRevealed && (state.roomDeck.length > 0 || !slot)) {
+    return `every room must be revealed before the ${roomName} can be sealed`;
+  }
+  const player = currentPlayer(state);
+  const here = roomEntryAt(state, slotOf(player.pos));
+  if (!here || here.roomId !== seal.room) return `clues are spent on the seal in the ${roomName}`;
+  if ((player.clues ?? 0) === 0) return `${player.name} has no clues to spend`;
+  return null;
+}
+
+export function sealTarget(state, ctx) {
+  const seal = ctx.scenario.seal;
+  return seal ? seal.cluesPerPlayer * state.players.length : 0;
+}
+
+/**
+ * Spend every clue in hand on the seal, up to what it still needs. It takes one
+ * action. When the last one is in, the Rift is sealed and the game is won.
+ */
+function doSeal(state, ctx) {
+  const problem = sealProblem(state, ctx);
+  if (problem) throw new Error(problem);
+  const player = currentPlayer(state);
+  const target = sealTarget(state, ctx);
+  const spend = Math.min(player.clues, target - state.sealClues);
+  player.clues -= spend;
+  state.sealClues += spend;
+  state.actionsLeft -= 1;
+  pushLog(
+    state,
+    `${player.name} spends ${spend} clue${spend === 1 ? '' : 's'} on the seal — ${state.sealClues} of ${target}.`,
+  );
+  if (state.sealClues >= target) {
+    state.over = { result: 'won', reason: 'The Rift is sealed.' };
+    pushLog(state, ctx.scenario.story?.sealed ?? 'The Rift is sealed.');
+  }
+  return state;
+}
+
 /** The investigators still in the game. */
 export function onTable(state) {
   return state.players.filter((p) => !p.out);
@@ -1904,6 +2409,13 @@ export function investigateProblem(state) {
   if (state.pending) return 'place the drawn room before doing anything else';
   if (state.choice) return 'answer the choice on the table first';
   if (state.actionsLeft <= 0) return 'no actions left this turn';
+
+  const here = slotOf(currentPlayer(state).pos);
+  const mourner = (state.monsters ?? []).find((m) => {
+    const at = slotOf(m.pos);
+    return m.power?.kind === 'blocks-investigate-room' && at.R === here.R && at.C === here.C;
+  });
+  if (mourner) return `the ${mourner.name} is in this room, and nobody can Investigate while it weeps`;
 
   const marker = state.encounters?.[posKey(currentPlayer(state).pos)];
   if (!marker) return 'there is no encounter card on this square to investigate';
@@ -1968,6 +2480,12 @@ export function useItemProblem(state, ctx, itemId) {
     const words = item.needs.map((need) => NEED_WORD[need]);
     return `the ${item.name} is still pending: it needs ${words.join(' and ')}, which the game does not have yet, so it does nothing for now`;
   }
+  const strike = item.effect.hit ?? item.effect.banish;
+  if (strike && strikeTargets(state, player, item.effect).length === 0) {
+    return strike.reach === 1
+      ? `there is no monster on or next to ${player.name}'s square for the ${item.name}`
+      : `there is no monster within ${strike.reach} spaces for the ${item.name}`;
+  }
   return null;
 }
 
@@ -2026,6 +2544,7 @@ function changePool(state, player, pool, amount, source) {
         ? `${player.name} has no ${word} left to lose (0 of ${max}).`
         : `${player.name} loses ${lost} ${word} (${source}) — ${player[pool]} of ${max} left.`,
     );
+    if (lost > 0 && pool === 'sanity') ruptureOfSelf(state, player);
     if (before > 0 && player[pool] === 0 && !player.down) {
       // Settled once the action that caused it has finished — see settleCasualties.
       player.down = pool === 'sanity' ? 'mad' : 'fallen';
@@ -2079,6 +2598,13 @@ function doChoose(state, action, ctx) {
 function resolveChoice(state, ctx, choice, picked) {
   const chooser = state.players.find((player) => player.id === choice.playerId);
   if (!chooser) throw new Error('the choice names an investigator who is not at the table');
+
+  if (choice.kind === 'strike') {
+    const target = (state.monsters ?? []).find((m) => m.id === picked.id);
+    if (!target) throw new Error('that monster is no longer on the table');
+    strikeMonster(state, ctx, target, choice.effect, choice.source);
+    return;
+  }
 
   if (choice.kind === 'new-investigator') {
     const sheet = ctx.investigators?.[picked.id];
@@ -2226,6 +2752,24 @@ function applyItemFields(state, ctx, item, player, effect) {
     player.damageShield = (player.damageShield ?? 0) + effect.damageShield;
     player.damageShieldName = item.name;
     pushLog(state, 'The next wound taken will be ignored, whatever it is dealt by.');
+  }
+
+  if (effect.hit || effect.banish) {
+    const targets = strikeTargets(state, player, effect);
+    if (targets.length === 1) {
+      strikeMonster(state, ctx, targets[0], effect, item.name);
+    } else if (targets.length > 1) {
+      beginChoice(state, {
+        kind: 'strike',
+        playerId: player.id,
+        prompt: `Which monster does the ${item.name} strike?`,
+        options: targets.map((m) => ({ id: m.id, label: `${m.name} (${m.health} Health)` })),
+        effect: { hit: effect.hit, banish: effect.banish },
+        source: item.name,
+      });
+    } else {
+      pushLog(state, `There is nothing for the ${item.name} to reach.`);
+    }
   }
 
   if (effect.revealRoom) {
@@ -2399,6 +2943,7 @@ function doEndTurn(state, ctx) {
   // Cards timed to the end of a round go over before the house moves, so the
   // table sees them before the corridors turn.
   flipAtRoundEnd(state, ctx, endingRound);
+  bossAtRoundEnd(state, ctx);
   const seated = onTable(state);
   const roller = seated[(endingRound - 1) % seated.length];
   state.lastShift = resolveShift(state, endingRound, roller, ctx);
@@ -2684,6 +3229,18 @@ function revealEncounter(state, ctx, key) {
     return card;
   }
 
+  // A Monster is the monster itself: it comes off the scenario's deck and stands
+  // on the square, and the encounter card is done with.
+  if (card.type === 'monster' && ctx.monsterCards) {
+    if (state.monsterDeck.length > 0 || state.monsterDiscard.length > 0) {
+      pushLog(state, `It is a Monster, on [${marker.number}].`);
+      state.encounterDiscard.push(marker.cardId);
+      delete state.encounters[key];
+      spawnMonster(state, ctx, posOfKey(key), 'the card is turned over');
+      return card;
+    }
+  }
+
   const word = ENCOUNTER_WORD[card.type];
   pushLog(
     state,
@@ -2929,8 +3486,10 @@ function resolveEntrance(state, ctx, slot, entry) {
   // "If Monster, place another face up on [2]." The card is laid face up, so the
   // encounter deck has already answered for it by the time this runs.
   if (card.specials.ifMonsterSpace !== null && numbers.length > 0) {
-    const first = state.encounters[posKey(posOfNumber(slot, numbers[0]))];
-    if (first && first.type === 'monster') {
+    const firstKey = posKey(posOfNumber(slot, numbers[0]));
+    const first = state.encounters[firstKey];
+    const monsterThere = (state.monsters ?? []).some((m) => posKey(m.pos) === firstKey);
+    if ((first && first.type === 'monster') || monsterThere) {
       const number = card.specials.ifMonsterSpace;
       if (placeEncounter(state, ctx, slot, number, card) === 'placed') {
         // It counts as one of the room's cards, so the record of the entrance

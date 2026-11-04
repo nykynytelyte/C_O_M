@@ -28,7 +28,7 @@ const here = (relative) => new URL(relative, import.meta.url);
 const core = JSON.parse(await readFile(here('../rules/core.json'), 'utf8'));
 const scenario = buildScenario(
   core,
-  JSON.parse(await readFile(here('../scenarios/mansion/scenario.json'), 'utf8')),
+  JSON.parse(await readFile(here('../scenarios/nameless-presence/scenario.json'), 'utf8')),
 );
 const rooms = roomsFromCsv(await readFile(here('../decks/rooms.csv'), 'utf8'));
 const entrances = entrancesFromCsv(await readFile(here('../decks/entrance.csv'), 'utf8'));
@@ -432,8 +432,9 @@ const ctx = { scenario, rooms, entrances, encounterCards, items, events, investi
 
   // What is still waiting, and what it is waiting for.
   const waiting = createGame(ctx, { seed: 41, playerCount: 2, investigatorIds: ['1', '2'] });
-  waiting.players[0].items = ['22', '10', '13'];
-  assert.match(useItemProblem(waiting, ctx, '10'), /needs a monster/);
+  waiting.players[0].items = ['22', '9', '10', '13'];
+  assert.match(useItemProblem(waiting, ctx, '9'), /needs a monster/);
+  assert.match(useItemProblem(waiting, ctx, '10'), /no monster on or next to/);
   assert.match(useItemProblem(waiting, ctx, '13'), /needs a lock/);
   assert.equal(useItemProblem(waiting, ctx, '22') ?? null, null, 'Dark Dice is no longer waiting for dice');
 

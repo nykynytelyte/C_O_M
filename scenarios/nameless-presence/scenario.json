@@ -1,0 +1,38 @@
+{
+  "id": "nameless-presence",
+  "name": "Scenario I: The Nameless Presence",
+  "version": 1,
+  "story": {
+    "epigraph": "This house is not haunted. It is alive. Every wall, every shadow is a ribcage or vein, and you are walking through its dreaming body. If you linger too long, the dreamer will wake.",
+    "intro": "Harrowgate Manor stands in silence, its doors locked for decades. But silence is not absence. The air is thick with whispers, the walls shift as though alive, and fragments of something older seep into the world. The monsters you face are not intruders — they are pieces of it. If too many gather, the barrier will collapse, and what sleeps beneath will rise. The Nameless Presence waits. You must decide whether to banish it… or survive its awakening.",
+    "bossArrives": "You call it a presence, but that word is a kindness. It has no face, no name, no language — only gravity. The world folds toward it. It is not evil. It is not wrathful. It simply is, and it wants to become. Long ago, the Rift held it in place. But each monster, each whisper, each shift weakens the lattice. And now, it listens. It stirs. When the Rift Room breathes open… It arrives.",
+    "sealed": "The last clue is spent in the Rift Room. The lattice holds, the Rift is sealed, and the Presence never manifests.",
+    "bossDefeated": "The Nameless Presence comes apart like a held breath let go. Harrowgate Manor is quiet — truly quiet — for the first time in decades.",
+    "lost": "Every investigator is gone. The Nameless Presence consumes the manor."
+  },
+  "bossRoom": "rift-room",
+  "bossRoomAppearsLast": true,
+  "monsterDeck": "monsters.csv",
+  "summon": {
+    "bossRoomRevealed": true,
+    "monstersAtLeast": 6
+  },
+  "seal": {
+    "room": "rift-room",
+    "allRoomsRevealed": true,
+    "cluesPerPlayer": 3
+  },
+  "boss": {
+    "id": "nameless-presence",
+    "name": "The Nameless Presence",
+    "title": "Awakened Horror Beyond the Rift",
+    "health": 8,
+    "space": 5,
+    "movement": 1,
+    "ignoresWalls": true,
+    "diagonal": true,
+    "aura": { "name": "Mindquake Aura", "reach": "adjacent", "sanity": -1 },
+    "onSanityLoss": { "name": "Rupture of Self", "die": 6, "min": 1, "max": 2, "sanity": -1 }
+  },
+  "rules": {}
+}

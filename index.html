@@ -271,6 +271,8 @@
       .token.p3 { background: #9d8fd0; }
       .token.p4 { background: #8fbf9a; }
       .token.monster { background: #b8473f; color: #f4e9e7; border-radius: 3px; }
+      .token.monster.boss { background: #1a0d0d; color: #e07a70; box-shadow: 0 0 0 2px #e07a70; width: 22px; height: 22px; font-size: 14px; }
+      .stat.won { color: #8fbf9a; }
       .investigator.out { opacity: 0.45; }
       .stat.over { color: #e07a70; }
       #story { font-style: italic; opacity: 0.85; }
@@ -557,7 +559,9 @@
         investigator sheets: Events and Items take and give both, and a ward takes the whole of the next
         loss. At 0 Health an investigator has fallen; at 0 Sanity they go mad and become a monster
         where they stood. Either way they are out, and the player picks a new investigator, who
-        starts in the Foyer. A few cards are still pending: they wait on monsters, a
+        starts in the Foyer. Monsters come from the scenario's own deck: a Monster card turned over brings one onto its
+        square, and the Wrench, Revolver, Knife and Holy Water can strike them. A few cards are still
+        pending: they wait on monster engagement, a
         choice, another investigator, a die, a lock or the encounter deck put back in order, and they
         say so when they turn up instead of pretending to work.
       </p>
@@ -589,6 +593,7 @@
           <h2>Actions</h2>
           <div class="controls">
             <button class="btn" id="investigate">Investigate</button>
+            <button class="btn" id="seal">Seal the Rift</button>
             <button class="btn primary" id="endturn">End turn</button>
           </div>
         </section>

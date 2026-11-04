@@ -36,7 +36,7 @@ const here = (relative) => new URL(relative, import.meta.url);
 const core = JSON.parse(await readFile(here('../rules/core.json'), 'utf8'));
 const scenario = buildScenario(
   core,
-  JSON.parse(await readFile(here('../scenarios/mansion/scenario.json'), 'utf8')),
+  JSON.parse(await readFile(here('../scenarios/nameless-presence/scenario.json'), 'utf8')),
 );
 const rooms = roomsFromCsv(await readFile(here('../decks/rooms.csv'), 'utf8'));
 const entrances = entrancesFromCsv(
@@ -1425,7 +1425,10 @@ function round(state) {
   // Health and Sanity are in the game, so no card may claim to wait on them.
   assert.deepEqual(items['2'].needs, [], 'the First Aid Kit waits on nothing now');
   assert.equal(items['2'].effect.health, 1);
-  assert.deepEqual(items['10'].needs, ['monster'], 'the Ritual Knife still waits on a monster');
+  assert.deepEqual(items['10'].needs, [], 'the Ritual Knife is a weapon now');
+  assert.deepEqual(items['10'].effect.hit, { damage: 2, reach: 1 });
+  assert.equal(items['10'].effect.health, -1, 'and it costs a point of Health');
+  assert.deepEqual(items['9'].needs, ['monster'], 'Binding Chalk still waits on engagement rules');
   assert.equal(items['1'].effect.move, 2);
   assert.equal(items['1'].effect.health, 0, 'and it takes no Health with it');
   assert.equal(items['11'].effect.sanityShield, 1, 'the amulet is a ward');

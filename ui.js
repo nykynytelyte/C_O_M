@@ -25,6 +25,10 @@ import {
   eventsFromCsv,
   itemsFromCsv,
   investigatorsFromCsv,
+  monstersFromCsv,
+  monsterCount,
+  sealProblem,
+  sealTarget,
   useItemProblem,
   doorsAt,
   roomKey,
@@ -32,6 +36,8 @@ import {
   OPPOSITE,
   ROOM_SIZE,
 } from './engine.js';
+
+const SCENARIO_DIR = './scenarios/nameless-presence';
 
 const DIRS = [
   { key: 'n', dr: -1, dc: 0 },
@@ -67,6 +73,7 @@ async function boot() {
     'copy',
     'diag',
     'story',
+    'seal',
     'flash',
   ]) {
     el[id] = document.getElementById(id);
@@ -76,7 +83,7 @@ async function boot() {
     const [core, scenarioData, roomsText, entranceText, encounterText, itemText, eventText, sheetText] =
       await Promise.all([
         fetchJson('./rules/core.json'),
-        fetchJson('./scenarios/mansion/scenario.json'),
+        fetchJson(`${SCENARIO_DIR}/scenario.json`),
         fetchText('./decks/rooms.csv'),
         fetchText('./decks/entrance.csv'),
         fetchText('./decks/encounters.csv'),
@@ -84,8 +91,12 @@ async function boot() {
         fetchText('./decks/events.csv'),
         fetchText('./decks/investigators.csv'),
       ]);
+    const monsterText = scenarioData.monsterDeck
+      ? await fetchText(`${SCENARIO_DIR}/${scenarioData.monsterDeck}`)
+      : null;
     ctx = {
       scenario: buildScenario(core, scenarioData),
+      monsterCards: monsterText ? monstersFromCsv(monsterText) : null,
       rooms: roomsFromCsv(roomsText),
       entrances: entrancesFromCsv(entranceText),
       encounterCards: encountersFromCsv(encounterText),
@@ -98,7 +109,9 @@ async function boot() {
     return;
   }
 
-  el.story.textContent = ctx.scenario.story?.intro ?? '';
+  el.story.textContent = ctx.scenario.story?.epigraph
+    ? `“${ctx.scenario.story.epigraph}”  ${ctx.scenario.story.intro ?? ''}`
+    : (ctx.scenario.story?.intro ?? '');
 
   el.players.innerHTML = '';
   for (let n = ctx.scenario.players.min; n <= ctx.scenario.players.max; n++) {
@@ -114,6 +127,8 @@ async function boot() {
   el.board.addEventListener('click', onBoardClick);
   el.investigate.addEventListener('click', () => dispatch({ type: 'INVESTIGATE' }));
   el.endturn.addEventListener('click', () => dispatch({ type: 'END_TURN' }));
+  el.seal.addEventListener('click', () => dispatch({ type: 'SEAL' }));
+  el.seal.hidden = !ctx.scenario.seal;
   el.newgame.addEventListener('click', () => newGame(true));
   el.copy.addEventListener('click', copyReplay);
 
@@ -280,11 +295,28 @@ function renderStatus() {
   if (state.over) {
     el.status.innerHTML =
       `<span class="stat"><b>Round</b> ${state.round}</span>` +
-      `<span class="stat over"><b>Game over</b> ${state.over.reason}</span>`;
+      `<span class="stat ${state.over.result === 'won' ? 'won' : 'over'}"><b>${
+        state.over.result === 'won' ? 'Victory' : 'Defeat'
+      }</b> ${state.over.reason}</span>`;
     el.endturn.disabled = true;
     el.investigate.disabled = true;
+    el.seal.disabled = true;
     return;
   }
+
+  const boss = (state.monsters ?? []).find((m) => m.kind === 'boss');
+  const summon = ctx.scenario.summon;
+  const scenarioStats =
+    (summon
+      ? `<span class="stat"><b>Monsters</b> ${monsterCount(state)} of ${summon.monstersAtLeast}</span>`
+      : '') +
+    (boss ? `<span class="stat over"><b>${boss.name}</b> ${boss.health} of ${boss.healthMax} Health</span>` : '') +
+    (ctx.scenario.seal && !boss
+      ? `<span class="stat"><b>Seal</b> ${state.sealClues ?? 0} of ${sealTarget(state, ctx)} clues</span>`
+      : '');
+  const seal = sealProblem(state, ctx);
+  el.seal.disabled = Boolean(seal);
+  el.seal.title = seal ?? 'Spend your clues on the seal in the Rift Room. Costs one action.';
 
   el.status.innerHTML =
     `<span class="stat"><b>Round</b> ${state.round}</span>` +
@@ -292,6 +324,7 @@ function renderStatus() {
     `<span class="stat"><b>Room</b> ${where}</span>` +
     `<span class="stat"><b>Actions</b> ${state.actionsLeft} of ${state.actionsPerTurn}</span>` +
     `<span class="stat"><b>Steps</b> ${steps}</span>` +
+    scenarioStats +
     `<span class="stat"><b>Clues</b> ${player.clues ?? 0}${
       player.clueLimit ? ` of ${player.clueLimit}` : ''
     }</span>` +
@@ -447,9 +480,13 @@ function buildSpaces(R, C, isRoom) {
         for (const monster of state.monsters ?? []) {
           if (monster.pos.gr !== gr || monster.pos.gc !== gc) continue;
           const token = document.createElement('span');
-          token.className = 'token monster';
-          token.textContent = 'M';
-          token.title = monster.name;
+          token.className = monster.kind === 'boss' ? 'token monster boss' : 'token monster';
+          token.textContent =
+            monster.kind === 'boss' ? '☉' : monster.kind === 'mad' ? '?' : monster.name.replace(/^The /, '')[0];
+          const card = monster.cardId ? ctx.monsterCards?.[monster.cardId] : null;
+          token.title =
+            `${monster.name} — ${monster.health} of ${monster.healthMax} Health` +
+            (card?.ability ? `\n${card.ability}: ${card.text}` : '');
           space.appendChild(token);
         }
         state.players.forEach((player, index) => {
