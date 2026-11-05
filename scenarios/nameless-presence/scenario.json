@@ -44,5 +44,9 @@
       "sanity": -1
     }
   },
-  "rules": {}
+  "rules": {
+    "encounters": {
+      "extraCluesPerPlayer": 1
+    }
+  }
 }

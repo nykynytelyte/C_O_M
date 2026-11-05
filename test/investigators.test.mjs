@@ -607,7 +607,12 @@ const ctx = { scenario, rooms, entrances, encounterCards, items, events, investi
  * as an action. Nobody else may.
  * ------------------------------------------------------------------ */
 {
-  assert.deepEqual(ctx.scenario.escape, { fromRound: 1, onlyWhenTrapped: 'foyer', sanity: 0 });
+  assert.deepEqual(ctx.scenario.escape, {
+    fromRound: 1,
+    onlyWhenTrapped: 'foyer',
+    towardFoyer: true,
+    sanity: 0,
+  });
 
   const base = createGame(ctx, { seed: 9, playerCount: 2, investigatorIds: ['1', '2'] });
   base.entranceDeck = ['17'];
@@ -634,6 +639,21 @@ const ctx = { scenario, rooms, entrances, encounterCards, items, events, investi
   assert.deepEqual(out.players[0].pos, { gr: 1, gc: 2 }, 'back into the Foyer');
   assert.equal(out.actionsLeft, shut.actionsLeft - 1);
   assert.equal(out.players[0].sanity, shut.players[0].sanity, 'and nothing else');
+
+  // Only a wall that leads back to the Foyer. In the Study's north-west corner,
+  // with the Gallery north (joined to the Study, but no way home), only the
+  // wall west into the Foyer will give.
+  const corner2 = structuredClone(base);
+  corner2.rooms['-1,1'] = { roomId: 'gallery', rot: 0 };
+  corner2.players[0].pos = { gr: 0, gc: 3 };
+  const homeward = reduce(corner2, { type: 'FORCE_WALL' }, ctx);
+  assert.equal(homeward.choice, null, 'no choice to make: one wall leads home');
+  assert.deepEqual(homeward.players[0].pos, { gr: 0, gc: 2 }, 'into the Foyer');
+  const loose = { ...ctx, scenario: { ...ctx.scenario, escape: { ...ctx.scenario.escape, towardFoyer: false } } };
+  assert.equal(reduce(corner2, { type: 'FORCE_WALL' }, loose).choice?.kind, 'force-wall', 'without it, either wall');
+  const nowhere = structuredClone(corner2);
+  nowhere.players[0].pos = { gr: 0, gc: 4 }; // top middle: only the Gallery is through a wall
+  assert.match(forceWallProblem(nowhere, ctx), /way back to the Foyer/);
 
   // A Nothing card is just nothing under the rule as played; with Passages on, it finds one.
   const found = structuredClone(base);
@@ -703,10 +723,11 @@ const ctx = { scenario, rooms, entrances, encounterCards, items, events, investi
 }
 
 /* ------------------------------------------------------------------ *
- * One extra Clue card in the encounter deck for each player
+ * Extra Clue cards: a scenario's to ask for (the Nameless Presence: 1 per player)
  * ------------------------------------------------------------------ */
 {
-  assert.equal(ctx.scenario.encounters.extraCluesPerPlayer, 1);
+  assert.equal(core.encounters.extraCluesPerPlayer, 0, 'the base game adds none');
+  assert.equal(ctx.scenario.encounters.extraCluesPerPlayer, 1, 'the Nameless Presence adds one per player');
   const printed = Object.keys(ctx.encounterCards).length;
   for (const players of [1, 3]) {
     const ids = ['1', '2', '3'].slice(0, players);
