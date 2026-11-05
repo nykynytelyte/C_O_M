@@ -38,8 +38,8 @@
     "extraCluesPerPlayer": 1
   },
   "escape": {
-    "fromRound": 10,
-    "onlyWhenTrapped": false,
+    "fromRound": 1,
+    "onlyWhenTrapped": "foyer",
     "sanity": 0
   },
   "combat": {

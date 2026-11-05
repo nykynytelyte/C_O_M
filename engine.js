@@ -810,6 +810,7 @@ function parseItemFields(value, id) {
     banish: null,
     bind: null,
     pushRooms: 0,
+    forceWall: false,
   };
 
   for (const token of (value ?? '').split('|').map((t) => t.trim()).filter(Boolean)) {
@@ -821,6 +822,11 @@ function parseItemFields(value, id) {
     // hit:2@1 deals 2 damage to a monster up to 1 space away; banish@1 removes
     // one outright. Range 1 is the investigator's own square and the four next
     // to it.
+    if (token === 'force-wall') {
+      out.forceWall = true;
+      continue;
+    }
+
     const bind = /^bind@([1-9])$/.exec(token);
     if (bind) {
       out.bind = { reach: Number(bind[1]) };
@@ -2876,8 +2882,13 @@ function doTrait(state, ctx) {
  *   "escape": { "fromRound": 10, "onlyWhenTrapped": false, "sanity": 1 }
  *
  *   fromRound        the first round it may be used (1 = from the start)
- *   onlyWhenTrapped  only when no door leads out of the investigator's room
- *   sanity           what it costs, on top of one action
+ *   onlyWhenTrapped  'room': only when no door leads out of the investigator's room;
+ *                    'foyer': only when no path through doors leads back to the Foyer
+ *   sanity           what it costs in Sanity, on top of one action
+ *   clues            what it costs in Clues, on top of one action
+ *   passages         it takes a Passage, earned by investigating a Nothing card
+ *   passagesEarly    before fromRound a Passage opens a wall; from it, no Passage needed
+ *   passageBypass    when not trapped, a Passage still opens a wall
  *
  * Leave it out and the walls hold.
  * ------------------------------------------------------------------ */
@@ -2893,6 +2904,34 @@ export function trappedInRoom(state, ctx, player) {
       if (there.R === slot.R && there.C === slot.C) continue;
       if (!stepProblem(open, from, to, ctx)) return false;
     }
+  }
+  return true;
+}
+
+/**
+ * Stuck, for a forced shift:
+ *   room    no door leads out of the investigator's room
+ *   foyer   no path through doors leads back to the Foyer
+ */
+function isStuck(state, ctx, player, test) {
+  if (test === 'room') return trappedInRoom(state, ctx, player);
+  const open = { ...state, monsters: [], drewThisTurn: false };
+  const home = ctx.scenario.startRoom;
+  const seen = new Set([posKey(player.pos)]);
+  let frontier = [player.pos];
+  while (frontier.length > 0) {
+    const next = [];
+    for (const pos of frontier) {
+      if (roomEntryAt(state, slotOf(pos))?.roomId === home) return false;
+      for (const dir of DIRS) {
+        const to = { gr: pos.gr + dir.dr, gc: pos.gc + dir.dc };
+        if (seen.has(posKey(to)) || !roomEntryAt(state, slotOf(to))) continue;
+        if (stepProblem(open, pos, to, ctx)) continue;
+        seen.add(posKey(to));
+        next.push(to);
+      }
+    }
+    frontier = next;
   }
   return true;
 }
@@ -2914,25 +2953,67 @@ function wallSquares(state, player) {
 
 /** Why the current investigator cannot force a wall, or null. */
 export function forceWallProblem(state, ctx) {
+  return escapeTerms(state, ctx).problem;
+}
+
+/**
+ * Whether the current investigator may force a wall, and whether doing so
+ * spends a Passage. One place decides both, so the check and the payment agree.
+ */
+function escapeTerms(state, ctx) {
   const rule = ctx.scenario.escape;
-  if (!rule) return 'the walls hold in this game';
-  if (state.over) return 'the game is over';
-  if (state.pending) return 'place the drawn room before doing anything else';
-  if (state.choice) return 'answer the choice on the table first';
-  if (state.actionsLeft <= 0) return 'no actions left this turn';
-  if (state.round < (rule.fromRound ?? 1)) return `the walls hold until round ${rule.fromRound}`;
+  const no = (problem) => ({ problem, passage: false });
+  if (!rule) return no('the walls hold in this game');
+  if (state.over) return no('the game is over');
+  if (state.pending) return no('place the drawn room before doing anything else');
+  if (state.choice) return no('answer the choice on the table first');
+  if (state.actionsLeft <= 0) return no('no actions left this turn');
   const player = currentPlayer(state);
-  if (engagedWith(state, player).length > 0) return 'you are engaged with a monster — Attack or Flee first';
-  if (rule.onlyWhenTrapped && !trappedInRoom(state, ctx, player)) {
-    return 'there is still a door out of this room';
+  if (engagedWith(state, player).length > 0) return no('you are engaged with a monster — Attack or Flee first');
+  const holdsPassage = (player.passages ?? 0) > 0;
+  let passage = false;
+
+  // Too early: a Passage still opens the wall (passagesEarly).
+  if (state.round < (rule.fromRound ?? 1)) {
+    if (rule.passagesEarly && holdsPassage) passage = true;
+    else {
+      return no(
+        rule.passagesEarly
+          ? `the walls hold until round ${rule.fromRound} — or use a Passage, found by investigating a Nothing card`
+          : `the walls hold until round ${rule.fromRound}`,
+      );
+    }
+  }
+
+  // Not trapped: a Passage still opens the wall (passageBypass).
+  const trapped =
+    !rule.onlyWhenTrapped ||
+    (rule.onlyWhenTrapped === 'foyer'
+      ? isStuck(state, ctx, player, 'foyer')
+      : trappedInRoom(state, ctx, player));
+  if (!trapped) {
+    if (rule.passageBypass && holdsPassage) passage = true;
+    else {
+      const why =
+        rule.onlyWhenTrapped === 'foyer'
+          ? 'you can still walk back to the Foyer, so the walls hold'
+          : 'there is still a door out of this room';
+      return no(rule.passageBypass ? `${why} — unless you use a Passage, found by investigating a Nothing card` : why);
+    }
+  }
+
+  if (rule.passages) {
+    if (!holdsPassage) return no('forcing a wall takes a Passage — investigate a Nothing card to find one');
+    passage = true;
   }
   if (rule.sanity && (player.sanity ?? 0) <= rule.sanity) {
-    return `${player.name} has too little Sanity left to force a wall`;
+    return no(`${player.name} has too little Sanity left to force a wall`);
   }
-  if (wallSquares(state, player).length === 0) {
-    return 'stand against a wall with a room on the other side';
+  if (rule.clues && (player.clues ?? 0) < rule.clues) {
+    return no(`forcing a wall costs ${rule.clues} Clue${rule.clues === 1 ? '' : 's'}`);
   }
-  return null;
+  if (wallSquares(state, player).length === 0) return no('stand against a wall with a room on the other side');
+  return { problem: null, passage };
 }
 
 export function forceWallTargets(state) {
@@ -2940,25 +3021,26 @@ export function forceWallTargets(state) {
 }
 
 function doForceWall(state, ctx, to) {
-  const problem = forceWallProblem(state, ctx);
-  if (problem) throw new Error(problem);
+  const terms = escapeTerms(state, ctx);
+  if (terms.problem) throw new Error(terms.problem);
   const player = currentPlayer(state);
   const squares = wallSquares(state, player);
 
   if (to) {
     const target = squares.find((p) => p.gr === to.gr && p.gc === to.gc);
     if (!target) throw new Error('there is no room on the other side of that wall');
-    forceThrough(state, ctx, player, target);
+    forceThrough(state, ctx, player, target, null, terms.passage);
     return state;
   }
   if (squares.length === 1) {
-    forceThrough(state, ctx, player, squares[0]);
+    forceThrough(state, ctx, player, squares[0], null, terms.passage);
     return state;
   }
   beginChoice(state, {
     kind: 'force-wall',
     playerId: player.id,
     prompt: 'Which wall do you force?',
+    passage: terms.passage,
     options: squares.map((p) => ({
       id: posKey(p),
       label: ctx.rooms[roomEntryAt(state, slotOf(p)).roomId].name,
@@ -2967,14 +3049,27 @@ function doForceWall(state, ctx, to) {
   return state;
 }
 
-function forceThrough(state, ctx, player, to) {
-  const rule = ctx.scenario.escape;
-  state.actionsLeft -= 1;
+function forceThrough(state, ctx, player, to, key = null, passage = false) {
   const there = slotOf(to);
   const room = ctx.rooms[roomEntryAt(state, there).roomId];
   player.pos = { ...to };
-  pushLog(state, `${player.name} forces a way through the wall into the ${room.name}.`);
-  if (rule.sanity) changePool(state, player, 'sanity', -rule.sanity, 'forcing the wall');
+  if (key) {
+    // The Antique Key opens the way: no action, no cost beyond the card.
+    pushLog(state, `${player.name} turns the ${key} in a wall that should have no lock, and steps into the ${room.name}.`);
+  } else {
+    const rule = ctx.scenario.escape;
+    state.actionsLeft -= 1;
+    pushLog(state, `${player.name} forces a way through the wall into the ${room.name}.`);
+    if (passage) {
+      player.passages -= 1;
+      pushLog(state, `${player.name} uses a Passage.`);
+    }
+    if (rule.clues) {
+      player.clues -= rule.clues;
+      pushLog(state, `It costs ${rule.clues} Clue${rule.clues === 1 ? '' : 's'}.`);
+    }
+    if (rule.sanity) changePool(state, player, 'sanity', -rule.sanity, 'forcing the wall');
+  }
   resolveEntrance(state, ctx, there, to);
   flipForSecondPlayer(state, ctx, there);
 }
@@ -3107,6 +3202,9 @@ export function useItemProblem(state, ctx, itemId) {
   if (item.needs.length > 0) {
     const words = item.needs.map((need) => NEED_WORD[need]);
     return `the ${item.name} is still pending: it needs ${words.join(' and ')}, which the game does not have yet, so it does nothing for now`;
+  }
+  if (item.effect.forceWall && wallSquares(state, player).length === 0) {
+    return `stand against a wall with a room on the other side to use the ${item.name}`;
   }
   if (item.effect.bind && strikeTargets(state, player, { banish: item.effect.bind }).length === 0) {
     return `there is no monster on or next to ${player.name}'s square for the ${item.name}`;
@@ -3280,7 +3378,7 @@ function resolveChoice(state, ctx, choice, picked) {
   }
 
   if (choice.kind === 'force-wall') {
-    forceThrough(state, ctx, chooser, posOfKey(String(picked.id)));
+    forceThrough(state, ctx, chooser, posOfKey(String(picked.id)), choice.key ?? null, Boolean(choice.passage));
     return;
   }
 
@@ -3455,6 +3553,21 @@ function applyItemFields(state, ctx, item, player, effect) {
   }
 
   if (effect.pushRooms) pushMonstersFromAdjacentRooms(state, ctx, player, effect.pushRooms);
+
+  if (effect.forceWall) {
+    const squares = wallSquares(state, player);
+    if (squares.length === 1) {
+      forceThrough(state, ctx, player, squares[0], item.name);
+    } else if (squares.length > 1) {
+      beginChoice(state, {
+        kind: 'force-wall',
+        playerId: player.id,
+        prompt: `Which wall does the ${item.name} open?`,
+        options: squares.map((p) => ({ id: posKey(p), label: ctx.rooms[roomEntryAt(state, slotOf(p)).roomId].name })),
+        key: item.name,
+      });
+    }
+  }
 
   if (effect.hit || effect.banish) {
     const targets = strikeTargets(state, player, effect);
@@ -3714,7 +3827,18 @@ function resolveShift(state, round, roller, ctx) {
   let roll = null;
   let occurs;
 
-  if (bar <= 0) {
+  // The house will not keep anyone in for good: while an investigator is
+  // stuck, the shift happens without a roll (shift.forceWhenStuck).
+  const force = cfg.forceWhenStuck;
+  const stuck = force ? onTable(state).filter((p) => isStuck(state, ctx, p, force.test)) : [];
+
+  if (stuck.length > 0) {
+    occurs = true;
+    pushLog(
+      state,
+      `Round ${round}: ${stuck.map((p) => p.name).join(' and ')} ${stuck.length === 1 ? 'is' : 'are'} cut off, so the house shifts without a roll.`,
+    );
+  } else if (bar <= 0) {
     occurs = true;
     pushLog(
       state,
@@ -3738,10 +3862,19 @@ function resolveShift(state, round, roller, ctx) {
 
   state.shiftPressure = 0;
   const rotated = [];
-  const slot = slotOf(roller.pos);
+  // Normally the rooms around the roller turn; a forced shift may instead turn
+  // the rooms around whoever is stuck.
+  const centres =
+    stuck.length > 0 && force.centre === 'stuck' ? stuck.map((p) => slotOf(p.pos)) : [slotOf(roller.pos)];
+  const around = new Map();
+  for (const slot of centres) {
+    for (const dir of DIRS) {
+      const near = { R: slot.R + dir.dr, C: slot.C + dir.dc };
+      around.set(roomKey(near.R, near.C), near);
+    }
+  }
 
-  for (const dir of DIRS) {
-    const near = { R: slot.R + dir.dr, C: slot.C + dir.dc };
+  for (const near of around.values()) {
     const entry = roomEntryAt(state, near);
     if (!entry) continue;
     const room = ctx.rooms[entry.roomId];
@@ -4005,7 +4138,15 @@ function collectEncounter(state, ctx, key) {
   }
 
   if (marker.type === 'nothing') {
-    pushLog(state, 'The card is taken away and nothing follows.');
+    // A Nothing card may still show the way through: with the 'passages' rule,
+    // the investigator notices a draft and keeps a Passage to force a wall.
+    const esc = ctx.scenario.escape;
+    if (esc?.passages || esc?.passagesEarly || esc?.passageBypass) {
+      player.passages = (player.passages ?? 0) + 1;
+      pushLog(state, `Nothing here — but ${player.name} feels a draft through the wall and keeps a Passage.`);
+    } else {
+      pushLog(state, 'The card is taken away and nothing follows.');
+    }
     setAside();
     return 'nothing';
   }

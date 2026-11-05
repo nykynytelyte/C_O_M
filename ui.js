@@ -715,6 +715,7 @@ function renderParty() {
       pool('Sanity', sheet ? `${player.sanity} / ${player.sanityMax}` : '—'),
       pool('Clues', sheet ? `${player.clues ?? 0} / ${player.clueLimit}` : `${player.clues ?? 0}`),
       pool('Items', `${(player.items ?? []).length}`),
+      ...(player.passages ? [pool('Passages', `${player.passages}`)] : []),
     );
     block.appendChild(pools);
 

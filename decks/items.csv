@@ -11,7 +11,7 @@ id,name,effect,needs,text
 10,Ritual Knife,health:-1|hit:2@1,,"Sacrifice 1 Health to deal 2 damage."
 11,Protective Amulet,sanity-shield:1,,"Ignore the next source of Sanity loss."
 12,Holy Water,banish@1,,"Instantly banish a Monster in an adjacent space (does not work on Boss)."
-13,Antique Key,,lock,"Open a locked door or gain access to a sealed room."
+13,Antique Key,force-wall,,"Open a locked door or gain access to a sealed room."
 14,Lucky Charm,,dice,"Reroll any die you just rolled."
 15,Clue Journal,clue:1,,"Gain 1 Clue Token."
 16,Signal Flare,pull:2,,"Move another player up to 2 spaces toward you."
