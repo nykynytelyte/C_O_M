@@ -604,27 +604,24 @@ const ctx = { scenario, rooms, entrances, encounterCards, items, events, investi
  * Forcing a wall
  *
  * The rule as played: cut off from the Foyer, you may step through a wall
- * as an action; a Passage (found under a Nothing card) lets anyone do it.
+ * as an action. Nobody else may.
  * ------------------------------------------------------------------ */
 {
-  assert.deepEqual(ctx.scenario.escape, {
-    fromRound: 1,
-    onlyWhenTrapped: 'foyer',
-    passageBypass: true,
-    sanity: 0,
-  });
+  assert.deepEqual(ctx.scenario.escape, { fromRound: 1, onlyWhenTrapped: 'foyer', sanity: 0 });
 
   const base = createGame(ctx, { seed: 9, playerCount: 2, investigatorIds: ['1', '2'] });
   base.entranceDeck = ['17'];
   base.rooms['0,1'] = { roomId: 'study', rot: 0 }; // east of the Foyer; no door back west
 
-  // In the Foyer, against its east wall: there is a way home, so the walls hold...
+  // In the Foyer, against its east wall: there is a way home, so the walls hold.
   const home = structuredClone(base);
   home.players[0].pos = { gr: 1, gc: 2 };
-  assert.match(forceWallProblem(home, ctx), /walk back to the Foyer.*unless you use a Passage/);
-  // ...unless a Passage is spent.
+  assert.match(forceWallProblem(home, ctx), /walk back to the Foyer, so the walls hold$/);
+
+  // A rule set that wants Passages can still have them: one opens a wall anyway.
+  const passing = { ...ctx, scenario: { ...ctx.scenario, escape: { ...ctx.scenario.escape, passageBypass: true } } };
   home.players[0].passages = 1;
-  const shortcut = reduce(home, { type: 'FORCE_WALL' }, ctx);
+  const shortcut = reduce(home, { type: 'FORCE_WALL' }, passing);
   assert.deepEqual(shortcut.players[0].pos, { gr: 1, gc: 3 }, 'through into the Study');
   assert.equal(shortcut.players[0].passages, 0, 'the Passage is spent');
   assert.equal(shortcut.actionsLeft, home.actionsLeft - 1, 'and an action');
@@ -638,13 +635,13 @@ const ctx = { scenario, rooms, entrances, encounterCards, items, events, investi
   assert.equal(out.actionsLeft, shut.actionsLeft - 1);
   assert.equal(out.players[0].sanity, shut.players[0].sanity, 'and nothing else');
 
-  // A Nothing card gives a Passage under this rule.
+  // A Nothing card is just nothing under the rule as played; with Passages on, it finds one.
   const found = structuredClone(base);
   found.players[0].ability = null;
   found.encounters['1,0'] = { entranceId: '17', room: '0,0', number: 4, cardId: '13', type: 'nothing', faceUp: true };
   found.players[0].pos = { gr: 1, gc: 0 };
-  const draft = reduce(found, { type: 'INVESTIGATE' }, ctx);
-  assert.equal(draft.players[0].passages, 1, 'investigating Nothing finds a Passage');
+  assert.equal(reduce(found, { type: 'INVESTIGATE' }, ctx).players[0].passages, undefined, 'Nothing is nothing');
+  assert.equal(reduce(found, { type: 'INVESTIGATE' }, passing).players[0].passages, 1, 'unless Passages are on');
 
   // The older variants stay available to a scenario: anyone, from round 10.
   const anyone = { ...ctx, scenario: { ...ctx.scenario, escape: { fromRound: 10, onlyWhenTrapped: false, sanity: 0 } } };

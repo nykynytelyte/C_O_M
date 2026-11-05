@@ -40,7 +40,6 @@
   "escape": {
     "fromRound": 1,
     "onlyWhenTrapped": "foyer",
-    "passageBypass": true,
     "sanity": 0
   },
   "combat": {
