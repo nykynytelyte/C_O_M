@@ -2889,6 +2889,7 @@ function doTrait(state, ctx) {
  *   passages         it takes a Passage, earned by investigating a Nothing card
  *   passagesEarly    before fromRound a Passage opens a wall; from it, no Passage needed
  *   passageBypass    when not trapped, a Passage still opens a wall
+ *   towardFoyer      only a wall into a room that leads back to the Foyer
  *
  * Leave it out and the walls hold.
  * ------------------------------------------------------------------ */
@@ -2915,14 +2916,19 @@ export function trappedInRoom(state, ctx, player) {
  */
 function isStuck(state, ctx, player, test) {
   if (test === 'room') return trappedInRoom(state, ctx, player);
+  return !reachesFoyer(state, ctx, player.pos);
+}
+
+/** Is there a path through doors from this square to the Foyer, monsters aside? */
+function reachesFoyer(state, ctx, start) {
   const open = { ...state, monsters: [], drewThisTurn: false };
   const home = ctx.scenario.startRoom;
-  const seen = new Set([posKey(player.pos)]);
-  let frontier = [player.pos];
+  const seen = new Set([posKey(start)]);
+  let frontier = [start];
   while (frontier.length > 0) {
     const next = [];
     for (const pos of frontier) {
-      if (roomEntryAt(state, slotOf(pos))?.roomId === home) return false;
+      if (roomEntryAt(state, slotOf(pos))?.roomId === home) return true;
       for (const dir of DIRS) {
         const to = { gr: pos.gr + dir.dr, gc: pos.gc + dir.dc };
         if (seen.has(posKey(to)) || !roomEntryAt(state, slotOf(to))) continue;
@@ -2933,7 +2939,7 @@ function isStuck(state, ctx, player, test) {
     }
     frontier = next;
   }
-  return true;
+  return false;
 }
 
 /** The squares through a wall from here into a room already on the table. */
@@ -2949,6 +2955,17 @@ function wallSquares(state, player) {
     out.push(to);
   }
   return out;
+}
+
+/**
+ * The walls the escape rule lets this investigator force. With `towardFoyer`,
+ * only a wall into a room that leads back to the Foyer through doors.
+ */
+function escapeWalls(state, ctx, player, passage = false) {
+  const squares = wallSquares(state, player);
+  // A Passage is an earned shortcut: the walk-home limit is for the cut-off only.
+  if (!ctx.scenario.escape?.towardFoyer || passage) return squares;
+  return squares.filter((to) => reachesFoyer(state, ctx, to));
 }
 
 /** Why the current investigator cannot force a wall, or null. */
@@ -3013,22 +3030,25 @@ function escapeTerms(state, ctx) {
     return no(`forcing a wall costs ${rule.clues} Clue${rule.clues === 1 ? '' : 's'}`);
   }
   if (wallSquares(state, player).length === 0) return no('stand against a wall with a room on the other side');
+  if (escapeWalls(state, ctx, player, passage).length === 0) {
+    return no('no wall here opens onto a way back to the Foyer');
+  }
   return { problem: null, passage };
 }
 
-export function forceWallTargets(state) {
-  return wallSquares(state, currentPlayer(state));
+export function forceWallTargets(state, ctx) {
+  return escapeWalls(state, ctx, currentPlayer(state));
 }
 
 function doForceWall(state, ctx, to) {
   const terms = escapeTerms(state, ctx);
   if (terms.problem) throw new Error(terms.problem);
   const player = currentPlayer(state);
-  const squares = wallSquares(state, player);
+  const squares = escapeWalls(state, ctx, player, terms.passage);
 
   if (to) {
     const target = squares.find((p) => p.gr === to.gr && p.gc === to.gc);
-    if (!target) throw new Error('there is no room on the other side of that wall');
+    if (!target) throw new Error('that wall does not open onto a way back to the Foyer');
     forceThrough(state, ctx, player, target, null, terms.passage);
     return state;
   }

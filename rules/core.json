@@ -35,11 +35,12 @@
   },
   "encounters": {
     "revealOnEndTurn": "none",
-    "extraCluesPerPlayer": 1
+    "extraCluesPerPlayer": 0
   },
   "escape": {
     "fromRound": 1,
     "onlyWhenTrapped": "foyer",
+    "towardFoyer": true,
     "sanity": 0
   },
   "combat": {

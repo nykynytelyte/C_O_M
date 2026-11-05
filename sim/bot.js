@@ -181,7 +181,7 @@ function chooseMove(state, ctx, rand) {
   // wall that leads nearest to where it wants to be.
   if (here >= 99 && !forceWallProblem(state, ctx)) {
     const crow = (pos) => Math.min(...[...targets].map((k) => gap(pos, posOf(k))));
-    const options = forceWallTargets(state)
+    const options = forceWallTargets(state, ctx)
       .map((to) => ({ to, walk: distanceToGoal(state, ctx, to, targets), crow: crow(to) }))
       .sort((a, b) => a.walk - b.walk || a.crow - b.crow);
     if (options.length && (options[0].walk < 99 || options[0].crow < crow(me.pos))) {
@@ -191,6 +191,18 @@ function chooseMove(state, ctx, rand) {
 
   const destinations = legalDestinations(state, ctx);
   if (destinations.length === 0) return null;
+
+  // Walled off, and no wall here will give: head for a square whose wall will.
+  if (here >= 99 && ctx.scenario.escape) {
+    const exits = escapeSquares(state, ctx, me);
+    if (exits.size > 0) {
+      const toExit = destinations
+        .map((dest) => ({ dest, d: exits.has(key(dest.pos)) ? 0 : distanceToGoal(state, ctx, dest.pos, exits) }))
+        .sort((a, b) => a.d - b.d);
+      const now = exits.has(key(me.pos)) ? 0 : distanceToGoal(state, ctx, me.pos, exits);
+      if (toExit[0].d < now) return { type: 'MOVE', path: toExit[0].dest.path };
+    }
+  }
   let best = [];
   let bestScore = Infinity;
   for (const dest of destinations) {
@@ -229,6 +241,23 @@ function chooseMove(state, ctx, rand) {
   // Nothing closer than standing still: no point spending the action.
   if (bestScore >= here && state.stepsLeft === 0) return null;
   return { type: 'MOVE', path: pick(best, rand).path };
+}
+
+/** Squares in the house from which this investigator could force a wall. */
+function escapeSquares(state, ctx, me) {
+  const out = new Set();
+  for (const slot of Object.keys(state.rooms)) {
+    const [R, C] = slot.split(',').map(Number);
+    for (let r = 0; r < 3; r++) {
+      for (let c = 0; c < 3; c++) {
+        const pos = { gr: R * 3 + r, gc: C * 3 + c };
+        const players = state.players.map((p) => (p.id === me.id ? { ...p, pos, engaged: [] } : p));
+        const there = { ...state, players, actionsLeft: 1, choice: null, pending: null };
+        if (!forceWallProblem(there, ctx)) out.add(key(pos));
+      }
+    }
+  }
+  return out;
 }
 
 /** The squares worth walking toward, given the state of the game. */
