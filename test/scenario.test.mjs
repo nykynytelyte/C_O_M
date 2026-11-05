@@ -397,6 +397,45 @@ const riftOpen = (game) => {
 }
 
 /* ------------------------------------------------------------------ *
+ * A new investigator is not caught up in the last one's fight
+ * (found in play: the newcomer arrived in the Foyer still "engaged")
+ * ------------------------------------------------------------------ */
+{
+  let replaced = null;
+  for (let seed = 1; seed <= 60 && !replaced; seed++) {
+    const game = start({ seed });
+    game.rooms['-1,0'] = { roomId: 'gallery', rot: 0 };
+    game.players[0].pos = { gr: -2, gc: 1 };
+    card(game, '1', { gr: -2, gc: 2 }); // a Husk beside them, away from the Foyer
+    game.players[0].engaged = [game.monsters[0].id];
+    game.players[0].health = 1;
+    const after = reduce(game, { type: 'ATTACK' }, ctx);
+    if (after.choice?.kind === 'new-investigator') replaced = after; // the miss took their last Health
+  }
+  assert.ok(replaced, 'an attack that misses on 1 Health takes the investigator out');
+  const fresh = reduce(replaced, { type: 'CHOOSE', optionId: replaced.choice.options[0].id }, ctx);
+  const seat = fresh.players[0];
+  assert.deepEqual(seat.pos, { gr: 1, gc: 1 }, 'the newcomer stands in the Foyer');
+  assert.deepEqual(seat.engaged, [], 'and is not engaged with anything');
+  assert.deepEqual(engagedWith(fresh, seat), []);
+
+  // On their own next turn they may move and investigate like anyone else.
+  let next = reduce(fresh, { type: 'END_TURN' }, ctx);
+  assert.equal(next.turnIndex, 0, 'their seat is up again');
+  assert.match(combatProblem(next, 'flee') ?? '', /not engaged/, 'Flee is not forced on them');
+  next = reduce(next, { type: 'MOVE', path: [{ gr: 1, gc: 2 }] }, ctx);
+  assert.deepEqual(next.players[0].pos, { gr: 1, gc: 2 }, 'they can walk');
+
+  // Any other way of leaving a monster's side ends the engagement too.
+  const carried = start();
+  card(carried, '1', { gr: 1, gc: 2 });
+  carried.players[0].engaged = [carried.monsters[0].id];
+  carried.players[0].pos = { gr: 1, gc: 0 }; // swapped, teleported, pushed: two spaces off
+  assert.deepEqual(engagedWith(carried, carried.players[0]), [], 'not beside it: not held by it');
+  assert.equal(reduce(carried, { type: 'MOVE', path: [{ gr: 0, gc: 0 }] }, ctx).players[0].engaged.length, 0);
+}
+
+/* ------------------------------------------------------------------ *
  * The summoning
  * ------------------------------------------------------------------ */
 {

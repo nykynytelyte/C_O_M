@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "description": "Digital table for Corridors of Madness.",
+  "license": "(MIT AND CC-BY-NC-4.0)",
   "scripts": {
     "test": "node test/engine.test.mjs && node test/investigators.test.mjs && node test/scenario.test.mjs",
     "sim": "node sim/run.mjs"
