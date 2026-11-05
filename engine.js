@@ -2063,6 +2063,7 @@ export function reduce(state, action, ctx) {
   settleCasualties(out, ctx);
   checkSummoning(out, ctx);
   settleCasualties(out, ctx);
+  pruneEngagements(out);
   return out;
 }
 
@@ -2164,7 +2165,16 @@ function seatInvestigator(state, ctx, player, sheet) {
     items: [],
     clues: 0,
     pos: startPosition(state, ctx) ?? player.pos,
+    // A new investigator walks in fresh: nothing the last one was caught up in
+    // follows them through the Foyer door.
+    engaged: [],
+    bound: [],
+    fledReroll: false,
+    hunchUsed: false,
+    passages: 0,
   });
+  delete player.detachedRound;
+  delete player.whisperedRound;
   delete player.down;
   delete player.downDuring;
   delete player.replacing;
@@ -2448,7 +2458,19 @@ function within(a, b, reach) {
 /** The monsters this investigator is engaged with, still on the table. */
 export function engagedWith(state, player) {
   const ids = new Set(player?.engaged ?? []);
-  return (state.monsters ?? []).filter((m) => ids.has(m.id));
+  // Engagement is with a monster beside you. Carried away from it by any means
+  // (a teleport, a swap, a forced wall, a new investigator in the seat) and it
+  // no longer holds you.
+  return (state.monsters ?? []).filter((m) => ids.has(m.id) && player.pos && within(player.pos, m.pos, 1));
+}
+
+/** Forget engagements with monsters that are gone or no longer beside you. */
+function pruneEngagements(state) {
+  for (const player of state.players) {
+    if (!player.engaged?.length) continue;
+    const held = new Set(engagedWith(state, player).map((m) => m.id));
+    player.engaged = player.engaged.filter((id) => held.has(id));
+  }
 }
 
 function engage(state, player, monster) {
